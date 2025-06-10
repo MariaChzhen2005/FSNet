@@ -1,343 +1,461 @@
 import torch
+from typing import Tuple, Optional, Callable
 
+# Differentiable and nondifferentiable L-BFGS solver
 
-# @torch.compile(mode="default")
 @torch.jit.script
 def _search_direction(
     g: torch.Tensor,               # (B, n)
-    S: torch.Tensor,               # (m, B, n)   stacked s‑vectors
-    Y: torch.Tensor,               # (m, B, n)   stacked y‑vectors
+    S: torch.Tensor,               # (m, B, n) stacked s‑vectors
+    Y: torch.Tensor,               # (m, B, n) stacked y‑vectors
     gamma: torch.Tensor            # (B, 1) or scalar
-) -> torch.Tensor:                 # returns d  (B, n)
+) -> torch.Tensor:                 # returns d (B, n)
     """
-    Compute d = −H_k^{-1} g_k   for L‑BFGS in batch mode.
+    Compute d = −H_k^{-1} g_k for L‑BFGS in batch mode using two-loop recursion.
 
     Parameters
     ----------
-    g      : current gradient            shape (B, n)
-    S, Y   : history of s_i, y_i         shape (m, B, n)
-    gamma  : scalar or (B,1) scaling for the initial Hessian
+    g : torch.Tensor
+        Current gradient, shape (B, n)
+    S : torch.Tensor
+        History of s_i vectors, shape (m, B, n)
+    Y : torch.Tensor
+        History of y_i vectors, shape (m, B, n)
+    gamma : torch.Tensor
+        Scalar or (B,1) scaling for the initial Hessian approximation
 
     Returns
     -------
-    d      : search direction            shape (B, n)
+    torch.Tensor
+        Search direction, shape (B, n)
     """
-    # if S.numel() == 0:           # first iteration → steepest descent
-    #     return -g
+    m = S.shape[0]  # history length
+    eps = 1e-10
+    rho = 1.0 / ((S * Y).sum(dim=2, keepdim=True) + eps)  # (m,B,1)
 
-    m = S.shape[0]               # history length
-    rho = 1.0 / ((S * Y).sum(dim=2, keepdim=True) + 1e-10)      # (m,B,1)
-
-    # ------------ first loop (reverse) -------------------------
-    q = g
+    # First loop (reverse order)
+    q = g.clone()
     alphas = []
     for i in range(m - 1, -1, -1):
         alpha_i = rho[i] * (S[i] * q).sum(dim=1, keepdim=True)  # (B,1)
         alphas.append(alpha_i)
         q = q - alpha_i * Y[i]
 
-    # initial Hessian: gamma * I
+    # Apply initial Hessian approximation: gamma * I
     r = gamma * q
 
-    # ------------ second loop (forward) ------------------------
+    # Second loop (forward order)
     alphas = alphas[::-1]
     for i in range(m):
         beta = rho[i] * (Y[i] * r).sum(dim=1, keepdim=True)
         r = r + S[i] * (alphas[i] - beta)
 
-    return -r                         # final search direction
+    return -r
 
 
-# @torch.compile(mode="default")
 @torch.jit.script
 def compute_gamma(S: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-    return (S[-1] * Y[-1]).sum(dim=1, keepdim=True)/ ((Y[-1] * Y[-1]).sum(dim=1, keepdim=True) + 1e-10)
-
-# ------------------------------------------------------------
-# Differentiable L‑BFGS 
-# -------------------------------------------------------------
-def lbfgs_solve_vec(
-    y_init: torch.Tensor,
-    x: torch.Tensor,
-    data,
-    *,
-    max_iter: int = 20,
-    memory: int = 20,
-    val_tol: float = 1e-6,
-    grad_tol: float = 1e-6,
-    scale: float = 1e3,
-    c: float = 1e-4,
-    rho_ls: float = 0.5,
-    max_ls_iter: int = 10,
-) -> torch.Tensor:
+    """
+    Compute the initial Hessian scaling factor γ = s^T y / y^T y.
     
+    Parameters
+    ----------
+    S : torch.Tensor
+        History of s vectors, shape (m, B, n)
+    Y : torch.Tensor
+        History of y vectors, shape (m, B, n)
+        
+    Returns
+    -------
+    torch.Tensor
+        Scaling factor, shape (B, 1)
     """
-    Differentiable L‑BFGS solver with a vectorized two‑loop recursion
-    and light‑weight backtracking line search.
-    """
-    # Objective function closure
-    def _obj(y: torch.Tensor) -> torch.Tensor:
-        eq  = (data.eq_resid(x, y)** 2).sum(dim=1).mean(0)
-        inq = (data.ineq_resid(x, y) ** 2).sum(dim=1).mean(0)
-        return scale * (eq + inq)
+    eps = 1e-10
+    s_dot_y = (S[-1] * Y[-1]).sum(dim=1, keepdim=True)
+    y_dot_y = (Y[-1] * Y[-1]).sum(dim=1, keepdim=True) + eps
+    return s_dot_y / y_dot_y
 
-    # Initialise
-    y = y_init.clone() 
+
+class LBFGSConfig:
+    """Configuration class for L-BFGS parameters."""
+    def __init__(
+        self,
+        max_iter: int = 20,
+        memory: int = 20,
+        val_tol: float = 1e-6,
+        grad_tol: float = 1e-6,
+        scale: float = 1.0,
+        c: float = 1e-4,
+        rho_ls: float = 0.5,
+        max_ls_iter: int = 10,
+        verbose: bool = False
+    ):
+        self.max_iter = max_iter
+        self.memory = memory
+        self.val_tol = val_tol
+        self.grad_tol = grad_tol
+        self.scale = scale
+        self.c = c
+        self.rho_ls = rho_ls
+        self.max_ls_iter = max_ls_iter
+        self.verbose = verbose
+
+
+def _create_objective_function(x: torch.Tensor, data, scale: float) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Create objective function closure."""
+    def _obj(y: torch.Tensor) -> torch.Tensor:
+        eq_residual = (data.eq_resid(x, y) ** 2).sum(dim=1).mean(0)
+        ineq_residual = (data.ineq_resid(x, y) ** 2).sum(dim=1).mean(0)
+        return scale * (eq_residual + ineq_residual)
+    return _obj
+
+
+def _check_convergence(f_val: torch.Tensor, g: torch.Tensor, config: LBFGSConfig) -> torch.Tensor:
+    """Check convergence criteria."""
+    val_converged = f_val / config.scale < config.val_tol
+    grad_converged = g.norm(dim=1) < config.grad_tol
+    return val_converged | grad_converged
+
+
+def _backtracking_line_search(
+    y: torch.Tensor,
+    d: torch.Tensor,
+    g: torch.Tensor,
+    f_val: torch.Tensor,
+    obj_func: Callable,
+    config: LBFGSConfig
+) -> float:
+    """Perform backtracking line search."""
+    step = 1.0
+    dir_deriv = (g * d).sum()
+    
+    with torch.no_grad():
+        for _ in range(config.max_ls_iter):
+            y_trial = y + step * d
+            f_trial = obj_func(y_trial)
+            if (f_trial <= f_val + config.c * step * dir_deriv).all():
+                break
+            step *= config.rho_ls
+    
+    return step
+
+
+def lbfgs_solve(
+    x: torch.Tensor,
+    y_init: torch.Tensor,
+    data,
+    config: Optional[LBFGSConfig] = None,
+    **kwargs
+) -> torch.Tensor:
+    """
+    Differentiable L‑BFGS solver with vectorized two‑loop recursion.
+    
+    Parameters
+    ----------
+    y_init : torch.Tensor
+        Initial guess, shape (B, n)
+    x : torch.Tensor
+        Input data
+    data : object
+        Data object with eq_resid and ineq_resid methods
+    config : LBFGSConfig, optional
+        Configuration object. If None, uses default parameters from kwargs.
+    **kwargs
+        Additional parameters if config is not provided
+        
+    Returns
+    -------
+    torch.Tensor
+        Solution, shape (B, n)
+    """
+    if config is None:
+        config = LBFGSConfig(**kwargs)
+    
+    # Initialize
+    y = y_init.clone()
     B, n = y_init.shape
-    # histories 
-    S_hist = torch.zeros(memory, B, n, device=y_init.device, dtype=y_init.dtype)
+    device, dtype = y_init.device, y_init.dtype
+    
+    # History buffers
+    S_hist = torch.zeros(config.memory, B, n, device=device, dtype=dtype)
     Y_hist = torch.zeros_like(S_hist)
     hist_len = 0
     hist_ptr = 0
     
-    f_val = _obj(y)
-    g     = torch.autograd.grad(f_val, y, create_graph=True)[0]
-    for k in range(max_iter):
-
-        # ----- convergence tests --------------------------------------------------
-        converged = (f_val / scale < val_tol) | (g.norm(dim=1) < grad_tol)
-        if converged.all():
+    # Create objective function
+    obj_func = _create_objective_function(x, data, config.scale)
+    
+    # Initial evaluation
+    f_val = obj_func(y)
+    g = torch.autograd.grad(f_val, y, create_graph=True)[0]
+    
+    for k in range(config.max_iter):
+        # Check convergence
+        if _check_convergence(f_val, g, config).all():
+            if config.verbose:
+                print(f"Converged at iteration {k}")
             break
-        # ----- search direction ---------------------------------------------------
-        if hist_len > 0:                              
-            # last hist_len entries in insertion order
-            idx = (hist_ptr - hist_len + torch.arange(hist_len, device=S_hist.device)) % memory
-            S = S_hist[idx]    # shape (hist_len, B, n)
+        
+        # Compute search direction
+        if hist_len > 0:
+            idx = (hist_ptr - hist_len + torch.arange(hist_len, device=device)) % config.memory
+            S = S_hist[idx]
             Y = Y_hist[idx]
             gamma = compute_gamma(S, Y)
             d = _search_direction(g, S, Y, gamma)
         else:
-            d = -0.1*g
-
-        # ----- backtracking line search (light autograd footprint) ---------------
-        step = 1.0
-        dir_deriv = (g * d).sum()
-        with torch.no_grad():                       # explore α without grads
-            for _ in range(max_ls_iter):
-                y_trial = y + step * d
-                f_trial = _obj(y_trial)
-                ok = f_trial <= f_val + c*step*dir_deriv
-                if ok.all(): 
-                    break
-
-                step *= rho_ls
-
-        # Re‑evaluate objective/grad ON GRAPH at the accepted step
+            d = -0.1 * g  # Steepest descent for first iteration
+        
+        # Line search
+        step = _backtracking_line_search(y, d, g, f_val, obj_func, config)
+        
+        # Update solution
         y_next = y + step * d
-        f_next = _obj(y_next)
+        f_next = obj_func(y_next)
         g_next = torch.autograd.grad(f_next, y_next, create_graph=True)[0]
-
-        # ----- store in circular buffer -----
-        S_hist[hist_ptr] = (y_next - y)
-        Y_hist[hist_ptr] = (g_next - g)
-        hist_ptr = (hist_ptr + 1) % memory
-        hist_len = min(hist_len + 1, memory)
-
+        
+        # Update history
+        S_hist[hist_ptr] = y_next - y
+        Y_hist[hist_ptr] = g_next - g
+        hist_ptr = (hist_ptr + 1) % config.memory
+        hist_len = min(hist_len + 1, config.memory)
+        
+        # Prepare for next iteration
         y = y_next
         f_val = f_next.clone()
         g = g_next.clone()
-
-        # if k % 9 == 0:                     # lightweight logging
-        #     print(f"iter {k:3d}:  f = {f_next.item()/scale:.3e}  |g| = {g_next.norm():.3e} step = {step:.3e}")
-
+        
+        if config.verbose and k % 5 == 0:
+            print(f"Iter {k:3d}: f = {f_next.item()/config.scale:.3e}, "
+                  f"|g| = {g_next.norm():.3e}, step = {step:.3e}")
+    
     return y
 
 
-def nondiff_lbfgs_solve_vec(
-    y_init: torch.Tensor,
+def nondiff_lbfgs_solve(
     x: torch.Tensor,
+    y_init: torch.Tensor,
     data,
-    *,
-    max_iter: int = 20,
-    memory: int = 20,
-    val_tol: float = 1e-6,
-    grad_tol: float = 1e-6,
-    scale: float = 1e3,
-    c: float = 1e-4,
-    rho_ls: float = 0.5,
-    max_ls_iter: int = 10,
-    S_hist = None,
-    Y_hist = None,
-    hist_len = 0,
-    hist_ptr = 0,
+    config: Optional[LBFGSConfig] = None,
+    S_hist: Optional[torch.Tensor] = None,
+    Y_hist: Optional[torch.Tensor] = None,
+    hist_len: int = 0,
+    hist_ptr: int = 0,
+    **kwargs
 ) -> torch.Tensor:
-    
     """
-    L‑BFGS identical to `lbfgs_solve_vec` but does not build a
-    backward graph.  Suitable for inference or when you never need
-    ∂ŷ/∂(anything).
-    """
-    # Objective function closure
-    def _obj(y: torch.Tensor) -> torch.Tensor:
-        eq  = (data.eq_resid(x, y)**2).sum(dim=1).mean(0)
-        inq = (data.ineq_resid(x, y)**2).sum(dim=1).mean(0)
-        return scale * (eq + inq)
-
-    # --- init (no autograd attached) ---------------------------------
-    y = y_init.detach().clone().requires_grad_(True)           # ensure leaf / no history
+    Non-differentiable L‑BFGS solver that doesn't build backward graph.
     
-    # history buffers
+    Parameters
+    ----------
+    y_init : torch.Tensor
+        Initial guess, shape (B, n)
+    x : torch.Tensor
+        Input data
+    data : object
+        Data object with eq_resid and ineq_resid methods
+    config : LBFGSConfig, optional
+        Configuration object
+    S_hist, Y_hist : torch.Tensor, optional
+        Pre-existing history buffers
+    hist_len, hist_ptr : int
+        History tracking variables
+    **kwargs
+        Additional parameters if config is not provided
+        
+    Returns
+    -------
+    torch.Tensor
+        Solution, shape (B, n)
+    """
+    if config is None:
+        config = LBFGSConfig(**kwargs)
+    
+    # Initialize without gradient tracking
+    y = y_init.detach().clone().requires_grad_(True)
+    B, n = y_init.shape
+    device, dtype = y_init.device, y_init.dtype
+    
+    # Initialize history buffers if not provided
     if S_hist is None:
-        B, n = y_init.shape
-        S_hist = torch.zeros(memory, B, n, device=y_init.device, dtype=y_init.dtype)
+        S_hist = torch.zeros(config.memory, B, n, device=device, dtype=dtype)
         Y_hist = torch.zeros_like(S_hist)
         hist_len = 0
         hist_ptr = 0
     
-    f_val = _obj(y)
-    g     = torch.autograd.grad(f_val, y, create_graph=False)[0]
-    for k in range(max_iter):
-
-        y.requires_grad_(False)          # stop tracing further ops
-        g = g.detach()                   # gradient as plain tensor
-
-        # -------- convergence checks --------------------------------
-        converged = (f_val / scale < val_tol) | (g.norm(dim=1) < grad_tol)
-        if converged.all():
+    obj_func = _create_objective_function(x, data, config.scale)
+    
+    f_val = obj_func(y)
+    g = torch.autograd.grad(f_val, y, create_graph=False)[0]
+    
+    for k in range(config.max_iter):
+        y.requires_grad_(False)
+        g = g.detach()
+        
+        # Check convergence
+        if _check_convergence(f_val, g, config).all():
+            if config.verbose:
+                print(f"Converged at iteration {k}")
             break
-       
-        # ----- search direction ---------------------------------------------------
-        if hist_len > 0:                               
-            # last hist_len entries in insertion order
-            idx = (hist_ptr - hist_len + torch.arange(hist_len, device=S_hist.device)) % memory
-            S = S_hist[idx]    # shape (hist_len, B, n)
+        
+        # Compute search direction
+        if hist_len > 0:
+            idx = (hist_ptr - hist_len + torch.arange(hist_len, device=device)) % config.memory
+            S = S_hist[idx]
             Y = Y_hist[idx]
             gamma = compute_gamma(S, Y)
             d = _search_direction(g, S, Y, gamma)
         else:
-            d = -0.1*g
-
-        # -------- backtracking line search (always no‑grad) ---------
-        step = 1.0
-        dir_deriv = (g * d).sum()
-        for _ in range(max_ls_iter):
-            y_try = y + step * d
-            if _obj(y_try) <= f_val + c * step * dir_deriv:
-                break
-            step *= rho_ls
-            
-        y_next = y + step * d                # accepted move
-
-        # -------- update history  (store *detached* tensors) --------
-        # need g_next for y_hist
+            d = -0.1 * g
+        
+        # Line search
+        step = _backtracking_line_search(y, d, g, f_val, obj_func, config)
+        
+        y_next = y + step * d
+        
+        # Update history with detached tensors
         y_next.requires_grad_(True)
-        f_next = _obj(y_next)
+        f_next = obj_func(y_next)
         g_next, = torch.autograd.grad(f_next, y_next, create_graph=False)
+        
         S_hist[hist_ptr] = (y_next - y).detach()
         Y_hist[hist_ptr] = (g_next - g).detach()
-        hist_ptr = (hist_ptr + 1) % memory
-        hist_len = min(hist_len + 1, memory)
-
-        y = y_next.detach()                  # next iter starts clean
-
+        hist_ptr = (hist_ptr + 1) % config.memory
+        hist_len = min(hist_len + 1, config.memory)
+        
+        y = y_next.detach()
         f_val = f_next.clone()
         g = g_next.clone()
-        # if k % 9 == 0:                     # lightweight logging
-        #     print(f"iter {k:3d}:  f = {_obj(y_next).item()/scale:.3e}  |g| = {g_next.norm():.3e}")
-
+        
+        if config.verbose and k % 5 == 0:
+            print(f"Iter {k:3d}: f = {f_next.item()/config.scale:.3e}, "
+                  f"|g| = {g_next.norm():.3e}, step = {step:.3e}")
+    
     return y
 
-def hybrid_lbfgs_solve_vec(
-    y_init: torch.Tensor,
+
+def hybrid_lbfgs_solve(
     x: torch.Tensor,
+    y_init: torch.Tensor,
     data,
-    *,
-    max_iter: int = 50,
-    max_diff_iter: int = 20,      #  how many steps to keep on the graph
-    memory: int = 20,
-    val_tol: float = 1e-6,
-    grad_tol: float = 1e-6,
-    scale: float = 1e3,
-    c: float = 1e-4,
-    rho_ls: float = 0.5,
-    max_ls_iter: int = 10,
+    max_diff_iter: int = 20,
+    config: Optional[LBFGSConfig] = None,
+    **kwargs
 ) -> torch.Tensor:
-    
     """
-    Hybrid L‑BFGS solver that starts with differentiable L‑BFGS
-    and switches to nondifferentiable L‑BFGS after `max_diff_iter`
-    iterations. This is useful for truncated backpropagation.
-    """
-
-    # Convenience closure for the scaled objective
-    def _obj(y: torch.Tensor) -> torch.Tensor:
-        # with amp.autocast(enabled=True): # Enable AMP context
-        eq  = (data.eq_resid(x, y)   ** 2).sum(dim=1).mean(0)
-        inq = (data.ineq_resid(x, y) ** 2).sum(dim=1).mean(0)
-        return scale * (eq + inq)
-
-    # Initialise
-    y = y_init.clone()                   # keep graph
+    Hybrid L‑BFGS solver with truncated backpropagation.
     
+    Starts with differentiable L‑BFGS and switches to non-differentiable
+    after max_diff_iter iterations for memory efficiency.
+    
+    Parameters
+    ----------
+    y_init : torch.Tensor
+        Initial guess, shape (B, n)
+    x : torch.Tensor
+        Input data
+    data : object
+        Data object with eq_resid and ineq_resid methods
+    max_diff_iter : int
+        Number of differentiable iterations before switching
+    config : LBFGSConfig, optional
+        Configuration object
+    **kwargs
+        Additional parameters if config is not provided
+        
+    Returns
+    -------
+    torch.Tensor
+        Solution with gradient connection to first max_diff_iter steps
+    """
+    if config is None:
+        config = LBFGSConfig(**kwargs)
+    
+    # Create a config for the differentiable phase
+    diff_config = LBFGSConfig(
+        max_iter=max_diff_iter,
+        memory=config.memory,
+        val_tol=config.val_tol,
+        grad_tol=config.grad_tol,
+        scale=config.scale,
+        c=config.c,
+        rho_ls=config.rho_ls,
+        max_ls_iter=config.max_ls_iter,
+        verbose=config.verbose
+    )
+    
+    # Run differentiable phase (shortened version of lbfgs_solve)
+    y = y_init.clone()
     B, n = y_init.shape
-    S_hist = torch.zeros(memory, B, n, device=y_init.device, dtype=y_init.dtype)
+    device, dtype = y_init.device, y_init.dtype
+    
+    S_hist = torch.zeros(config.memory, B, n, device=device, dtype=dtype)
     Y_hist = torch.zeros_like(S_hist)
     hist_len = 0
     hist_ptr = 0
     
-    f_val = _obj(y)
+    obj_func = _create_objective_function(x, data, config.scale)
+    f_val = obj_func(y)
     g = torch.autograd.grad(f_val, y, create_graph=True)[0]
+    
     for k in range(max_diff_iter):
-        # ----- convergence tests --------------------------------------------------
-        converged = (f_val / scale < val_tol) | (g.norm(dim=1) < grad_tol)
-        if converged.all():
-            break
+        if _check_convergence(f_val, g, diff_config).all():
+            if config.verbose:
+                print(f"Converged in differentiable phase at iteration {k}")
+            return y
         
-        # ----- search direction ---------------------------------------------------
-        if hist_len > 0:                                   # stack history (m,B,n)
-            # last hist_len entries in insertion order
-            idx = (hist_ptr - hist_len + torch.arange(hist_len, device=S_hist.device)) % memory
-            S = S_hist[idx]    # shape (hist_len, B, n)
+        # Search direction
+        if hist_len > 0:
+            idx = (hist_ptr - hist_len + torch.arange(hist_len, device=device)) % config.memory
+            S = S_hist[idx]
             Y = Y_hist[idx]
             gamma = compute_gamma(S, Y)
             d = _search_direction(g, S, Y, gamma)
         else:
-            d = -0.1*g
-
-        # ----- backtracking line search (light autograd footprint) ---------------
-        step = 1.0
-        dir_deriv = (g * d).sum()
-        with torch.no_grad():                       # explore α without grads
-            for _ in range(max_ls_iter):
-                y_trial = y + step * d
-                f_trial = _obj(y_trial)
-                if f_trial <= f_val + c * step * dir_deriv:
-                    break
-                step *= rho_ls
-
-        # Re‑evaluate objective/grad ON GRAPH at the accepted step
-        y_next     = y + step * d
-        f_next     = _obj(y_next)
-        g_next     = torch.autograd.grad(f_next, y_next, create_graph=True)[0]
-
-        # ----- store in circular buffer -----
-        S_hist[hist_ptr] = (y_next - y)
-        Y_hist[hist_ptr] = (g_next - g)
-        hist_ptr = (hist_ptr + 1) % memory
-        hist_len = min(hist_len + 1, memory)
-
+            d = -0.1 * g
+        
+        # Line search
+        step = _backtracking_line_search(y, d, g, f_val, obj_func, diff_config)
+        
+        # Update
+        y_next = y + step * d
+        f_next = obj_func(y_next)
+        g_next = torch.autograd.grad(f_next, y_next, create_graph=True)[0]
+        
+        # Update history
+        S_hist[hist_ptr] = y_next - y
+        Y_hist[hist_ptr] = g_next - g
+        hist_ptr = (hist_ptr + 1) % config.memory
+        hist_len = min(hist_len + 1, config.memory)
+        
         y = y_next
         f_val = f_next.clone()
         g = g_next.clone()
-
-        # if k%5 == 0:                     # lightweight logging
-        #     print(f"iter {k:3d}:  f = {f_next.item()/scale:.3e}  |g| = {g_next.norm():.3e} step = {step:.3e}")
-
-    # --- now switch to nondiff mode --------------------------------
-    y_nondiff = nondiff_lbfgs_solve_vec(
-        y, x, data,
-        max_iter=max_iter - max_diff_iter,
-        memory=memory,
-        val_tol=val_tol,
-        grad_tol=grad_tol,
-        scale=scale,
-        c=c,
-        rho_ls=rho_ls,
-        max_ls_iter=max_ls_iter,
+        
+        if config.verbose and k % 5 == 0:
+            print(f"Diff iter {k:3d}: f = {f_next.item()/config.scale:.3e}, "
+                  f"|g| = {g_next.norm():.3e}, step = {step:.3e}")
+    
+    # Switch to non-differentiable phase
+    remaining_config = LBFGSConfig(
+        max_iter=config.max_iter - max_diff_iter,
+        memory=config.memory,
+        val_tol=config.val_tol,
+        grad_tol=config.grad_tol,
+        scale=config.scale,
+        c=config.c,
+        rho_ls=config.rho_ls,
+        max_ls_iter=config.max_ls_iter,
+        verbose=config.verbose
+    )
+    
+    y_nondiff = nondiff_lbfgs_solve(
+        x, y, data, remaining_config,
         S_hist=S_hist,
         Y_hist=Y_hist,
         hist_len=hist_len,
-        hist_ptr=hist_ptr,
+        hist_ptr=hist_ptr
     )
-
+    
+    # Return with gradient connection only to differentiable phase
     return y + (y_nondiff - y).detach()

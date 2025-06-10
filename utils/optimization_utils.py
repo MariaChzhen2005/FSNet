@@ -1,11 +1,9 @@
 import numpy as np
 import time
-
 import torch
 from torch.utils.data import TensorDataset, random_split
-
 import cvxpy as cp
-from cvxpylayers.torch import CvxpyLayer
+# from cvxpylayers.torch import CvxpyLayer
 import casadi as ca
 from qpth.qp import QPFunction
 
@@ -13,18 +11,17 @@ DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 torch.set_default_dtype(torch.float64)
 
 
-
 ###################################################################
 # Base PROBLEM
 ###################################################################
 class BaseProblem:
     def __init__(self, dataset, val_size, test_size, seed):
-        self.input_L = torch.tensor(dataset['XL'] )
-        self.input_U = torch.tensor(dataset['XU'] )
-        self.L = torch.tensor(dataset['YL'] )
-        self.U = torch.tensor(dataset['YU'] )
-        self.X = torch.tensor(dataset['X'] )
-        self.Y = torch.tensor(dataset['Y'] )
+        self.input_L = torch.tensor(dataset['XL'])
+        self.input_U = torch.tensor(dataset['XU'])
+        self.L = torch.tensor(dataset['YL'])
+        self.U = torch.tensor(dataset['YU'])
+        self.X = torch.tensor(dataset['X'])
+        self.Y = torch.tensor(dataset['Y'])
         self.num = dataset['X'].shape[0]
         self.device = DEVICE
 
@@ -94,12 +91,12 @@ class BaseProblem:
             Y_scale = self.scale_full(Y)
         return Y_scale
 
-    def cal_penalty(self, X, Y):
-        penalty = torch.cat([self.ineq_resid(X, Y), self.eq_resid(X, Y)], dim=1)
-        return torch.abs(penalty)
+    # def cal_penalty(self, X, Y):
+    #     penalty = torch.cat([self.ineq_resid(X, Y), self.eq_resid(X, Y)], dim=1)
+    #     return torch.abs(penalty)
 
-    def check_feasibility(self, X, Y):
-        return self.cal_penalty(X, Y)
+    # def check_feasibility(self, X, Y):
+    #     return self.cal_penalty(X, Y)
 
 
 ###################################################################
@@ -112,25 +109,18 @@ class QPProblem(BaseProblem):
                    Gy <= h
                    L<= x <=U
     """
+
     def __init__(self, dataset, val_size, test_size, seed):
         super().__init__(dataset, val_size, test_size, seed)
-        self.Q_np = dataset['Q']
-        self.p_np = dataset['p']
-        self.A_np = dataset['A']
-        self.G_np = dataset['G']
-        self.h_np = dataset['h']
-        self.L_np = dataset['YL']
-        self.U_np = dataset['YU']
-        # self.X_np = dataset['X']
-        self.Q = torch.tensor(dataset['Q'] )
-        self.p = torch.tensor(dataset['p'] )
-        self.A = torch.tensor(dataset['A'] )
-        self.G = torch.tensor(dataset['G'] )
-        self.h = torch.tensor(dataset['h'] )
-        self.L = torch.tensor(dataset['YL'] )
-        self.U = torch.tensor(dataset['YU'] )
-        self.X = torch.tensor(dataset['X'] )
-        self.Y = torch.tensor(dataset['Y'] )
+        self.Q = torch.tensor(dataset['Q'])
+        self.p = torch.tensor(dataset['p'])
+        self.A = torch.tensor(dataset['A'])
+        self.G = torch.tensor(dataset['G'])
+        self.h = torch.tensor(dataset['h'])
+        self.L = torch.tensor(dataset['YL'])
+        self.U = torch.tensor(dataset['YU'])
+        self.X = torch.tensor(dataset['X'])
+        self.Y = torch.tensor(dataset['Y'])
         self.xdim = dataset['X'].shape[1]
         self.ydim = dataset['Q'].shape[0]
         self.neq = dataset['A'].shape[0]
@@ -163,49 +153,12 @@ class QPProblem(BaseProblem):
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
 
-    def complete_partial(self, X, Y, backward=True):
+    def complete_partial(self, X, Y):
         Y_full = torch.zeros(X.shape[0], self.ydim, device=X.device)
         Y_full[:, self.partial_vars] = Y
         Y_full[:, self.other_vars] = (X - Y @ self.A_partial.T) @ self.A_other_inv.T
         return Y_full   
-
-   
-    def opt_solve(self, X, accuracy='default', tol=5e-3):
-        Q, p, A, G, h, L, U = \
-            self.Q_np, self.p_np, self.A_np, self.G_np, self.h_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        total_time = 0
-        n = 0
-        for Xi in X_np:
-            y = cp.Variable(self.ydim)
-            prob = cp.Problem(cp.Minimize((1 / 2) * cp.quad_form(y, Q) + p.T @ y),
-                                [G @ y <= h, y <= U, y >= L,
-                                A @ y == Xi])
-            start_time = time.time()
-            if accuracy == 'default':
-                prob.solve()
-            elif accuracy == 'reduced':
-                prob.solve(
-                    solver = 'OSQP',
-                    eps_rel = tol,
-                    eps_abs = tol,
-                )
-            else:
-                raise NotImplementedError                
-            end_time = time.time()
-            print(n, np.max(y.value), np.min(y.value), y.value[0:5].T, end='\r')
-            n += 1
-            Y.append(y.value)
-            objs.append(prob.value)
-            total_time += (end_time - start_time)
-        sols = np.array(Y)
-        objs = np.array(objs)
-        
-        return sols, objs, total_time
-
-
+    
     def qpth_projection(self, X, Y):
         batch_size = X.shape[0]
         n = self.ydim
@@ -234,19 +187,6 @@ class QPProblem(BaseProblem):
         return Y_proj
 
 
-    # def init_cvx_projection(self):
-    #     ### for cvxpy projection
-    #     y = cp.Variable(self.ydim)
-    #     x = cp.Parameter(self.X.shape[1])
-    #     y_pred = cp.Parameter(self.Y.shape[1])
-    #     constraints = [self.G_np @ y <= self.h_np, y <= self.U_np, y >= self.L_np,
-    #                                self.A_np @ y == x]
-    #     prob = cp.Problem(cp.Minimize(cp.sum_squares(y - y_pred)), constraints)
-
-    #     self.cvx_projection = CvxpyLayer(prob, parameters=[x, y_pred], variables=[y])
-        ###
-
-            
 ###################################################################
 # QCQP Problem
 ###################################################################
@@ -259,8 +199,7 @@ class QCQPProblem(QPProblem):
     """
     def __init__(self, dataset, val_size, test_size, seed):
         super().__init__(dataset, val_size, test_size, seed)
-        self.H_np = dataset['H']
-        self.H = torch.tensor(dataset['H'] )
+        self.H = torch.tensor(dataset['H'])
 
     def __str__(self):
         return 'QCQPProblem-{}-{}-{}-{}'.format(
@@ -276,61 +215,7 @@ class QCQPProblem(QPProblem):
         u = Y - self.U
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
-
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, H, h, L, U = \
-            self.Q_np, self.p_np, self.A_np, self.G_np, self.H_np, self.h_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        total_time = 0
-        n = 0
-        for Xi in X_np:
-            y = cp.Variable(self.ydim)
-            constraints = [A @ y == Xi, y <= U, y >= L]
-            for i in range(self.nineq):
-                Ht = H[i]
-                Gt = G[i]
-                ht = h[i]
-                constraints.append(0.5 * cp.quad_form(y, Ht) + Gt.T @ y <= ht)
-            prob = cp.Problem(cp.Minimize((1 / 2) * cp.quad_form(y, Q) + p.T @ y),
-                                constraints)
-            start_time = time.time()
-            if accuracy == 'default':
-                prob.solve(solver = 'SCS')
-            elif accuracy == 'reduced':
-                prob.solve(
-                    solver = 'SCS',
-                    eps_rel = tol,
-                    eps_abs = tol,
-                )
-            else:
-                raise NotImplementedError
-            end_time = time.time()
-            print(n, np.max(y.value), np.min(y.value), y.value[0:5].T, end='\r')
-            n += 1
-            Y.append(y.value)
-            objs.append(prob.value)
-            total_time += (end_time - start_time)
-
-        sols = np.array(Y)
-        objs = np.array(objs)
-
-        return sols, objs, total_time
-
-    # def init_cvx_projection(self):
-    #     ### for cvxpy projection
-    #     y = cp.Variable(self.ydim)
-    #     x = cp.Parameter(self.X.shape[1])
-    #     y_pred = cp.Parameter(self.Y.shape[1])
-    #     constraints = [self.A_np @ y == x, y <= self.U_np, y >= self.L_np]
-    #     for i in range(self.nineq):
-    #         constraints.append(0.5*cp.quad_form(y, self.H_np[i]) + self.G_np[i].T @ y <= self.h_np[i])
-
-    #     prob = cp.Problem(cp.Minimize(cp.sum_squares(y - y_pred)), constraints)
-
-    #     self.cvx_projection = CvxpyLayer(prob, parameters=[x, y_pred], variables=[y])
-        
+    
 
 ###################################################################
 # SOCP Problem
@@ -345,8 +230,6 @@ class SOCPProblem(QPProblem):
 
     def __init__(self, dataset, val_size, test_size, seed):
         super().__init__(dataset, val_size, test_size, seed)
-        self.C_np = dataset['C']
-        self.d_np = dataset['d']
         self.C = torch.tensor(dataset['C'] )
         self.d = torch.tensor(dataset['d'] )
 
@@ -365,60 +248,11 @@ class SOCPProblem(QPProblem):
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
 
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, h, C, d, L, U = \
-            self.Q_np, self.p_np, self.A_np, self.G_np, self.h_np, self.C_np, self.d_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        total_time = 0
-        n = 0
-        for Xi in X_np:
-            y = cp.Variable(self.ydim)
-            soc_constraints = [cp.SOC(C[i].T @ y + d[i], G[i] @ y + h[i]) for i in range(self.nineq)]
-            constraints = soc_constraints + [A @ y == Xi] + [y <= U] + [y >= L]
-            prob = cp.Problem(cp.Minimize((1 / 2) * cp.quad_form(y, Q) + p.T @ y), constraints)
-            start_time = time.time()
-            if accuracy == 'default':
-                prob.solve()
-            elif accuracy == 'reduced':
-                prob.solve(
-                    solver = 'SCS',
-                    eps_rel = tol,
-                    eps_abs = tol,
-                )
-            else:
-                raise NotImplementedError
-            
-            end_time = time.time()
-            print(n, np.max(y.value), np.min(y.value), y.value[0:5].T, end='\r')
-            n += 1
-            Y.append(y.value)
-            objs.append(prob.value)
-            total_time += (end_time - start_time)
-
-        sols = np.array(Y)
-        objs = np.array(objs)
-        
-        return sols, objs, total_time
-    
-    # def init_cvx_projection(self):
-    #     ## for cvxpy projection
-    #     y = cp.Variable(self.ydim)
-    #     x = cp.Parameter(self.X.shape[1])
-    #     y_pred = cp.Parameter(self.Y.shape[1])
-    #     soc_constraints = [cp.SOC(self.C_np[i].T @ y + self.d_np[i], self.G_np[i] @ y + self.h_np[i]) for i in range(self.nineq)]
-    #     constraints = [self.A_np @ y == x, y <= self.U_np, y >= self.L_np] + soc_constraints
-    #     prob = cp.Problem(cp.Minimize(cp.sum_squares(y - y_pred)), constraints)
-    #     self.cvx_projection = CvxpyLayer(prob, parameters=[x, y_pred], variables=[y])
-
-
-
-
 
 ###################################################################
 # NONCONVEX PROBLEM
 ###################################################################
+
 class nonconvexQPProblem(QPProblem):
     def __str__(self):
         return 'QPProblem-{}-{}-{}-{}'.format(
@@ -435,41 +269,6 @@ class nonconvexQPProblem(QPProblem):
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
 
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, h, L, U = \
-                self.Q_np, self.p_np, self.A_np, self.G_np, self.h_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        num_var = self.ydim
-        num_eq = self.neq
-        num_ineq = self.nineq
-        start_time = time.time()
-        print('running nonconvex qp', end='\r')
-        for Xi in X_np:
-            y = ca.MX.sym('y_var', num_var)
-            obj_func = 0.5 * ca.mtimes(y.T, ca.mtimes(Q, y)) + ca.dot(p, ca.sin(y))
-            eq_constraints = A @ y - Xi
-            ineq_constraints = G @ ca.sin(y) - h*(ca.cos(Xi))
-            # ineq_constraints = G @ y - h
-            nlp = {'x': y, 'f': obj_func, 'g': ca.vertcat(eq_constraints, ineq_constraints)}
-            opts = {'ipopt.print_level': 0, 'print_time': 0}
-            solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            # Define bounds for variables and constraints
-            lbg = np.concatenate([np.zeros(num_eq), -np.inf * np.ones(num_ineq)])
-            ubg = np.concatenate([np.zeros(num_eq), np.zeros(num_ineq)])
-            lbx = L
-            ubx = U
-            # Solve the NLP
-            res = solver(lbg=lbg, ubg=ubg, lbx=lbx, ubx=ubx)
-            sol_x = res['x'].full().flatten().tolist()
-            obj = res['f'].full()[0,0]
-            Y.append(sol_x)
-            objs.append(obj)
-        end_time = time.time()
-        total_time = end_time - start_time
-        return np.array(Y), np.array(objs), total_time
-        
 
 class nonconvexQCQPProblem(QCQPProblem):
     def __str__(self):
@@ -489,45 +288,6 @@ class nonconvexQCQPProblem(QCQPProblem):
         u = Y - self.U
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
-    
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, H, h, L, U = \
-                self.Q_np, self.p_np, self.A_np, self.G_np, self.H_np, self.h_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        num_var = self.ydim
-        num_eq = self.neq
-        num_ineq = self.nineq
-        start_time = time.time()
-        print('running nonconvex qcqp', end='\r')
-        for Xi in X_np:
-            y = ca.MX.sym('y_var', num_var)
-            obj_func = 0.5 * ca.mtimes(y.T, ca.mtimes(Q, y)) + ca.dot(p, ca.sin(y))
-
-            eq_constraints = A @ y - Xi
-            ineq_constraints = []
-            for i in range(num_ineq):
-                ineq_constraints.append(0.5 * ca.mtimes(y.T, ca.mtimes(H[i], y)) + ca.dot(G[i], ca.cos(y)) - h[i])
-            ineq_constraints = ca.vertcat(*ineq_constraints)
-
-            nlp = {'x': y, 'f': obj_func, 'g': ca.vertcat(eq_constraints, ineq_constraints)}
-            opts = {'ipopt.print_level': 0, 'print_time': 0}
-            solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            # Define bounds for variables and constraints
-            lbg = np.concatenate([np.zeros(num_eq), -np.inf * np.ones(num_ineq)])
-            ubg = np.concatenate([np.zeros(num_eq), np.zeros(num_ineq)])
-            lbx = L
-            ubx = U
-            # Solve the NLP
-            res = solver(lbg=lbg, ubg=ubg, lbx=lbx, ubx=ubx)
-            sol_x = res['x'].full().flatten().tolist()
-            obj = res['f'].full()[0,0]
-            Y.append(sol_x)
-            objs.append(obj)
-        end_time = time.time()
-        total_time = end_time - start_time
-        return np.array(Y), np.array(objs), total_time
 
 
 class nonconvexSOCPProblem(SOCPProblem):
@@ -550,50 +310,11 @@ class nonconvexSOCPProblem(SOCPProblem):
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
  
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, h, C, d, L, U = \
-                self.Q_np, self.p_np, self.A_np, self.G_np, self.h_np, self.C_np, self.d_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        num_var = self.ydim
-        num_eq = self.neq
-        num_ineq = self.nineq
-        start_time = time.time()
-        print('running nonconvex socp', end='\r')
-        for Xi in X_np:
-            y = ca.MX.sym('y_var', num_var)
-            obj_func = 0.5 * ca.mtimes(y.T, ca.mtimes(Q, y)) + ca.dot(p, ca.sin(y))
-
-            eq_constraints = A @ y - Xi
-
-            ineq_constraints = []
-            for i in range(num_ineq):
-                ineq_constraints.append(ca.norm_2(G[i] @ ca.cos(y) + h[i]) - (ca.dot(C[i], y) + d[i]))
-            ineq_constraints = ca.vertcat(*ineq_constraints)
-            
-            nlp = {'x': y, 'f': obj_func, 'g': ca.vertcat(eq_constraints, ineq_constraints)}
-            opts = {'ipopt.print_level': 0, 'print_time': 0}
-            solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            # Define bounds for variables and constraints
-            lbg = np.concatenate([np.zeros(num_eq), -np.inf * np.ones(num_ineq)])
-            ubg = np.concatenate([np.zeros(num_eq), np.zeros(num_ineq)])
-            lbx = L
-            ubx = U
-            # Solve the NLP
-            res = solver(lbg=lbg, ubg=ubg, lbx=lbx, ubx=ubx)
-            sol_x = res['x'].full().flatten().tolist()
-            obj = res['f'].full()[0]
-            Y.append(sol_x)
-            objs.append(obj)
-        end_time = time.time()
-        total_time = end_time - start_time
-        return np.array(Y), np.array(objs), total_time
-
 
 ###################################################################
 # NONSMOOTH NONCONVEX
 ###################################################################
+
 class nonsmooth_nonconvexQPProblem(QPProblem):
     def __str__(self):
         return 'QPProblem-{}-{}-{}-{}'.format(
@@ -609,43 +330,6 @@ class nonsmooth_nonconvexQPProblem(QPProblem):
         u = Y - self.U
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
-    
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, h, L, U = \
-                self.Q_np, self.p_np, self.A_np, self.G_np, self.h_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        num_var = self.ydim
-        num_eq = self.neq
-        num_ineq = self.nineq
-        start_time = time.time()
-        print('running nonconvex qp', end='\r')
-        for Xi in X_np:
-            y = ca.MX.sym('y_var', num_var)
-            t = ca.MX.sym('t_var')
-            obj_func = 0.5 * ca.mtimes(y.T, ca.mtimes(Q, y)) + ca.dot(p, ca.sin(y)) + 0.1*t
-            eq_constraints = A @ y - Xi
-            ineq_constraints = G @ ca.sin(y) - h*(ca.cos(Xi))
-            soc = ca.dot(y, y) - t**2
-            # ineq_constraints = G @ y - h
-            nlp = {'x': ca.vertcat(y, t), 'f': obj_func, 'g': ca.vertcat(eq_constraints, ineq_constraints, soc)}
-            opts = {'ipopt.print_level': 0, 'print_time': 0}
-            solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            # Define bounds for variables and constraints
-            lbg = np.concatenate([np.zeros(num_eq), -np.inf * np.ones(num_ineq+1)])
-            ubg = np.concatenate([np.zeros(num_eq), np.zeros(num_ineq+1)])
-            lbx = np.concatenate([L, [0]])
-            ubx = np.concatenate([U, [np.inf]])
-            # Solve the NLP
-            res = solver(lbg=lbg, ubg=ubg, lbx=lbx, ubx=ubx)
-            sol_x = res['x'].full().flatten().tolist()[:-1]
-            obj = res['f'].full()[0,0]
-            Y.append(sol_x)
-            objs.append(obj)
-        end_time = time.time()
-        total_time = end_time - start_time
-        return np.array(Y), np.array(objs), total_time
     
 
 class nonsmooth_nonconvexQCQPProblem(QCQPProblem):
@@ -667,48 +351,6 @@ class nonsmooth_nonconvexQCQPProblem(QCQPProblem):
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
     
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, H, h, L, U = \
-                self.Q_np, self.p_np, self.A_np, self.G_np, self.H_np, self.h_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        num_var = self.ydim
-        num_eq = self.neq
-        num_ineq = self.nineq
-        start_time = time.time()
-        print('running nonconvex qcqp', end='\r')
-        for Xi in X_np:
-            y = ca.MX.sym('y_var', num_var)
-            t = ca.MX.sym('t_var')
-            obj_func = 0.5 * ca.mtimes(y.T, ca.mtimes(Q, y)) + ca.dot(p, ca.sin(y)) + 0.1*t
-
-            eq_constraints = A @ y - Xi
-            ineq_constraints = []
-            soc = ca.dot(y, y) - t**2
-            for i in range(num_ineq):
-                ineq_constraints.append(0.5 * ca.mtimes(y.T, ca.mtimes(H[i], y)) + ca.dot(G[i], ca.cos(y)) - h[i])
-            ineq_constraints.append(soc)
-            ineq_constraints = ca.vertcat(*ineq_constraints)
-
-            nlp = {'x': ca.vertcat(y, t), 'f': obj_func, 'g': ca.vertcat(eq_constraints, ineq_constraints)}
-            opts = {'ipopt.print_level': 0, 'print_time': 0}
-            solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            # Define bounds for variables and constraints
-            lbg = np.concatenate([np.zeros(num_eq), -np.inf * np.ones(num_ineq+1)])
-            ubg = np.concatenate([np.zeros(num_eq), np.zeros(num_ineq+1)])
-            lbx = np.concatenate([L, [0]])
-            ubx = np.concatenate([U, [np.inf]])
-            # Solve the NLP
-            res = solver(lbg=lbg, ubg=ubg, lbx=lbx, ubx=ubx)
-            sol_x = res['x'].full().flatten().tolist()[:-1]
-            obj = res['f'].full()[0,0]
-            Y.append(sol_x)
-            objs.append(obj)
-        end_time = time.time()
-        total_time = end_time - start_time
-        return np.array(Y), np.array(objs), total_time
- 
 
 class nonsmooth_nonconvexSOCPProblem(SOCPProblem):
     def __str__(self):
@@ -728,49 +370,9 @@ class nonsmooth_nonconvexSOCPProblem(SOCPProblem):
         resids = torch.cat([res, l, u], dim=1)
         return torch.clamp(resids, 0)
     
-    def opt_solve(self, X, accuracy='default', tol=1e-5):
-        Q, p, A, G, h, C, d, L, U = \
-                self.Q_np, self.p_np, self.A_np, self.G_np, self.h_np, self.C_np, self.d_np, self.L_np, self.U_np
-        X_np = X.detach().cpu().numpy()
-        Y = []
-        objs = []
-        num_var = self.ydim
-        num_eq = self.neq
-        num_ineq = self.nineq
-        start_time = time.time()
-        print('running nonconvex socp', end='\r')
-        for Xi in X_np:
-            y = ca.MX.sym('y_var', num_var)
-            t = ca.MX.sym('t_var')
 
-            obj_func = 0.5 * ca.mtimes(y.T, ca.mtimes(Q, y)) + ca.dot(p, ca.sin(y)) + 0.1*t
 
-            eq_constraints = A @ y - Xi
-            soc = ca.dot(y, y) - t**2
-            ineq_constraints = []
-            for i in range(num_ineq):
-                ineq_constraints.append(ca.norm_2(G[i] @ ca.cos(y) + h[i]) - (ca.dot(C[i], y) + d[i]))
-            ineq_constraints.append(soc)
-            ineq_constraints = ca.vertcat(*ineq_constraints)
-            
-            nlp = {'x': ca.vertcat(y, t), 'f': obj_func, 'g': ca.vertcat(eq_constraints, ineq_constraints)}
-            opts = {'ipopt.print_level': 0, 'print_time': 0}
-            solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            # Define bounds for variables and constraints
-            lbg = np.concatenate([np.zeros(num_eq), -np.inf * np.ones(num_ineq+1)])
-            ubg = np.concatenate([np.zeros(num_eq), np.zeros(num_ineq+1)])
-            lbx = np.concatenate([L, [0]])
-            ubx = np.concatenate([U, [np.inf]])
-            # Solve the NLP
-            res = solver(lbg=lbg, ubg=ubg, lbx=lbx, ubx=ubx)
-            sol_x = res['x'].full().flatten().tolist()[:-1]
-            obj = res['f'].full()[0]
-            Y.append(sol_x)
-            objs.append(obj)
-        end_time = time.time()
-        total_time = end_time - start_time
-        return np.array(Y), np.array(objs), total_time
-
+#########################################################################
 # For DC3 correction
 def ineq_partial_grad(data, X, Y):
     # Extract partial variables and create a copy that requires gradients
@@ -803,3 +405,4 @@ def grad_steps(data, X, Y, config):
         old_Y_step = new_Y_step
 
     return Y_new
+

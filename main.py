@@ -2,7 +2,7 @@ import yaml
 import torch
 import time
 import argparse
-from utils.trainer import load_instance, train_net
+from utils.trainer import load_instance, Trainer
 
 # Define available problem types and problems
 PROBLEM_TYPES = ['convex', 'nonconvex', 'nonsmooth_nonconvex']
@@ -78,19 +78,19 @@ def create_parser():
     
     # Override neural network parameters
     if args.lr:
-        config['nn_para']['lr'] = args.lr
+        config['lr'] = args.lr
     if args.lr_decay:
-        config['nn_para']['lr_decay'] = args.lr_decay
+        config['lr_decay'] = args.lr_decay
     if args.lr_decay_step:
-        config['nn_para']['lr_decay_step'] = args.lr_decay_step
+        config['lr_decay_step'] = args.lr_decay_step
     if args.num_epochs:
-        config['nn_para']['num_epochs'] = args.num_epochs
+        config['num_epochs'] = args.num_epochs
     if args.hidden_dim:
-        config['nn_para']['hidden_dim'] = args.hidden_dim
+        config['hidden_dim'] = args.hidden_dim
     if args.num_layers:
-        config['nn_para']['num_layers'] = args.num_layers
+        config['num_layers'] = args.num_layers
     if args.dropout:
-        config['nn_para']['dropout'] = args.dropout
+        config['dropout'] = args.dropout
     
     # Feasibility seeking parameters
     if args.scale:
@@ -125,9 +125,13 @@ def main():
     data, result_save_dir = load_instance(config)
     
     # Train and test the model
-    print(f"Training model using {config['method']} method with seed {config['seed']} for {config['nn_para']['num_epochs']} epochs")
+    print(f"Training model using {config['method']} method with seed {config['seed']} for {config['num_epochs']} epochs")
     start_time = time.time()
-    train_net(data, config['method'], config, result_save_dir)
+    
+    # Instantiate and use the Trainer
+    trainer = Trainer(data=data, config=config, save_dir=result_save_dir)
+    trainer.train() # Assuming train method handles both training and testing/evaluation
+    
     training_time = time.time() - start_time
     print(f"Training and testing completed in {training_time:.2f} seconds")
     return print("Done!!!")
