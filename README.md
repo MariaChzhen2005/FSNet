@@ -49,7 +49,7 @@ python main.py \
   * `FSNet`              (Feasibility-Seeking Neural Network)
   * `penalty`            (Penalty method)
   * `adaptive_penalty`   (Adaptive Penalty method)
-  * `DC3`                (Differentiable Convex–Concave Correction, DC3)
+  * `DC3`                (Deep Constraint Completion and Correction)
   * `projection`         (Projection-based method; supported for QP only)
 * `--prob_type`
 
