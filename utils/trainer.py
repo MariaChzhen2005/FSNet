@@ -324,10 +324,9 @@ class Trainer:
     def _update_epoch_params(self, epoch: int) -> None:
         """Update parameters based on epoch."""
         # FSNet tolerance decay
-        if (self.method == 'FSNet' and 
-            (epoch + 1) % self.config[self.method]['decay_tol_step'] == 0):
-            self.method_params['val_tol'] = np.clip(
-                self.method_params['val_tol'] / 10, 
+        if (self.method == 'FSNet' and (epoch + 1) % self.config_method['decay_tol_step'] == 0):
+            self.config_method['val_tol'] = np.clip(
+                self.config_method['val_tol'] / 10, 
                 a_min=1e-9, 
                 a_max=1e-6
             )
