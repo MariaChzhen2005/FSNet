@@ -66,4 +66,6 @@ python main.py \
 Example:
 ```bash
 python main.py --method FSNet --prob_type convex --prob_name qp
+python main.py --method FSNet --prob_type nonconvex --prob_name socp --dropout 0.05
+
 ```
