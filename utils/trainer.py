@@ -289,7 +289,7 @@ class Trainer:
         epoch_metrics = {'obj':0.0, 'loss': 0.0, 'objective': 0.0, 'eq_violation': 0.0, 'ineq_violation': 0.0, 'eq_violation_l1': 0.0, 'ineq_violation_l1': 0.0, 'distance': 0.0}
         
         # Update method parameters if needed
-        self._update_epoch_params(epoch)
+        #self._update_epoch_params(epoch)
         
         for batch_idx, (X_batch, _) in enumerate(train_loader):
             X_batch = X_batch.to(DEVICE, non_blocking=True)
