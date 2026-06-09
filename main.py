@@ -55,7 +55,7 @@ def create_parser():
         config = yaml.safe_load(f)
     
     # Override config with command-line arguments if provided
-    if args.method:
+    if args.seed:
         config['seed'] = args.seed
     if args.method:
         config['method'] = args.method
