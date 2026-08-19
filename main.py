@@ -33,6 +33,10 @@ def create_parser():
     parser.add_argument('--val_size', type=int, help='Size of validation dataset')
     parser.add_argument('--test_size', type=int, help='Size of test dataset')
     parser.add_argument('--dropout', type=float, help='Dropout rate for the model')
+    parser.add_argument('--feasibility_tol', type=float,
+                        help='Tolerance used to compute feasibility rates')
+    parser.add_argument('--no_progress_bar', action='store_true',
+                        help='Disable tqdm progress bars')
 
     # Neural network parameters
     parser.add_argument('--lr', type=float, help='Learning rate')
@@ -91,6 +95,10 @@ def create_parser():
         config['num_layers'] = args.num_layers
     if args.dropout:
         config['dropout'] = args.dropout
+    if args.feasibility_tol is not None:
+        config['feasibility_tol'] = args.feasibility_tol
+    if args.no_progress_bar:
+        config['progress_bar'] = False
     
     # Feasibility seeking parameters
     if args.scale:

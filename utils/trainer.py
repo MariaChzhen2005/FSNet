@@ -2,12 +2,14 @@ import numpy as np
 import pickle
 import time
 import os 
-from typing import Dict, Tuple
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 # import wandb 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 import json
 
@@ -17,6 +19,48 @@ from models.neural_networks import MLP
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 torch.set_default_dtype(torch.float64)
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert metric records to strict JSON-compatible values."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if torch.is_tensor(value):
+        value = value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
+        return _json_safe(value)
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        value = float(value)
+        return value if np.isfinite(value) else None
+    return value
+
+
+def _progress_postfix(metrics: Dict[str, float], include_loss: bool = False) -> Dict[str, str]:
+    """Select a compact set of metrics for tqdm without hiding the full history."""
+    postfix = {}
+    if include_loss and 'loss' in metrics:
+        postfix['loss'] = f"{metrics['loss']:.3e}"
+    objective = metrics.get('objective', metrics.get('obj'))
+    if objective is not None:
+        postfix['obj'] = f"{objective:.3e}"
+    if 'opt_gap_mean' in metrics:
+        postfix['gap'] = f"{metrics['opt_gap_mean']:.2e}"
+    if 'feasibility_rate' in metrics:
+        postfix['feas'] = f"{100 * metrics['feasibility_rate']:.1f}%"
+    eq_violation = metrics.get('eq_violation_max_mean', metrics.get('eq_violation_l1'))
+    ineq_violation = metrics.get('ineq_violation_max_mean', metrics.get('ineq_violation_l1'))
+    if eq_violation is not None:
+        postfix['eq'] = f"{eq_violation:.2e}"
+    if ineq_violation is not None:
+        postfix['ineq'] = f"{ineq_violation:.2e}"
+    return postfix
 
 
 def load_instance(config):
@@ -120,23 +164,40 @@ class Trainer:
         
         self.config_method = config[self.method]
         self.evaluator = Evaluator(data, self.method, config)
+        self.metric_history = []
+        self.metrics_jsonl_path = None
         
         self._initialize_params()
 
-    def compute_loss(self, X_batch: torch.Tensor, Y_pred: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(
+        self,
+        X_batch: torch.Tensor,
+        Y_pred: torch.Tensor,
+        Y_true: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes the loss and additional metrics."""
         Y_pred_scaled = self.data.scale(Y_pred)
         metrics = {}
         if self.method == "penalty":
-            return self._penalty_loss(X_batch, Y_pred_scaled, metrics)
+            loss, metrics = self._penalty_loss(X_batch, Y_pred_scaled, metrics)
         elif self.method == "adaptive_penalty":
-            return self._adaptive_penalty_loss(X_batch, Y_pred_scaled, metrics)
+            loss, metrics = self._adaptive_penalty_loss(X_batch, Y_pred_scaled, metrics)
         elif self.method == "FSNet":
-            return self._fsnet_loss(X_batch, Y_pred_scaled, metrics)
+            loss, metrics = self._fsnet_loss(X_batch, Y_pred_scaled, metrics)
         elif self.method == "DC3":
-            return self._dc3_loss(X_batch, Y_pred_scaled, metrics)
+            loss, metrics = self._dc3_loss(X_batch, Y_pred_scaled, metrics)
         elif self.method == "projection":
-            return self._projection_loss(X_batch, Y_pred_scaled, metrics)
+            loss, metrics = self._projection_loss(X_batch, Y_pred_scaled, metrics)
+        else:
+            raise ValueError(f"Unknown training method: {self.method}")
+
+        if Y_true is not None:
+            metrics.update(
+                self.evaluator._compute_batch_metrics(X_batch, metrics.pop('_Y_final'), Y_true)
+            )
+        else:
+            metrics.pop('_Y_final', None)
+        return loss, metrics
         
 
     def _penalty_loss(self, X_batch: torch.Tensor, Y_pred_scaled: torch.Tensor, metrics: Dict) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -158,6 +219,7 @@ class Trainer:
             'ineq_violation': ineq_violation.mean().item(),
             'eq_violation_l1': eq_violation_l1.mean().item(),
             'ineq_violation_l1': ineq_violation_l1.mean().item(),
+            '_Y_final': Y_pred_scaled,
         })
         return loss, metrics
 
@@ -188,6 +250,7 @@ class Trainer:
             'ineq_violation': ineq_violation.mean().item(),
             'eq_violation_l1': eq_violation_l1.mean().item(),
             'ineq_violation_l1': ineq_violation_l1.mean().item(),
+            '_Y_final': Y_pred_scaled,
         })
         return loss, metrics
     
@@ -230,6 +293,7 @@ class Trainer:
             'eq_violation_l1': eq_violation_l1.mean().item(),
             'ineq_violation_l1': ineq_violation_l1.mean().item(),
             'distance': distance.item(),
+            '_Y_final': Y_final,
         })
         return loss, metrics
     
@@ -254,6 +318,7 @@ class Trainer:
             'ineq_violation': ineq_violation.mean().item(),
             'eq_violation_l1': eq_violation_l1.mean().item(),
             'ineq_violation_l1': ineq_violation_l1.mean().item(),
+            '_Y_final': Y_final,
         })
 
         return loss, metrics
@@ -279,6 +344,7 @@ class Trainer:
             'eq_violation_l1': eq_violation_l1.mean().item(),
             'ineq_violation_l1': ineq_violation_l1.mean().item(),
             'distance': distance.item(),
+            '_Y_final': Y_final,
         })
 
         return loss, metrics
@@ -286,34 +352,46 @@ class Trainer:
     def train_epoch(self, train_loader: DataLoader, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
-        epoch_metrics = {'obj':0.0, 'loss': 0.0, 'objective': 0.0, 'eq_violation': 0.0, 'ineq_violation': 0.0, 'eq_violation_l1': 0.0, 'ineq_violation_l1': 0.0, 'distance': 0.0}
-        
-        # Update method parameters if needed
-        #self._update_epoch_params(epoch)
-        
-        for batch_idx, (X_batch, _) in enumerate(train_loader):
+        batch_metrics_history = []
+        epoch_start = time.perf_counter()
+        learning_rate = self.optimizer.param_groups[0]['lr']
+        progress_enabled = self.config.get('progress_bar', True)
+        batch_progress = tqdm(
+            train_loader,
+            desc=f"Train {epoch + 1}/{self.config['num_epochs']}",
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not progress_enabled,
+        )
+
+        for X_batch, Y_true in batch_progress:
             X_batch = X_batch.to(DEVICE, non_blocking=True)
+            Y_true = Y_true.to(DEVICE, non_blocking=True)
             Y_pred = self.model(X_batch)
-            
-            loss, batch_metrics = self.compute_loss(X_batch, Y_pred)
-            
+
+            loss, batch_metrics = self.compute_loss(X_batch, Y_pred, Y_true)
+
             self.optimizer.zero_grad()
             loss.mean().backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            
-            # Accumulate metrics
-            for key, value in batch_metrics.items():
-                epoch_metrics[key] += value
-            epoch_metrics['loss'] += loss.mean().item()
-        
+
+            batch_metrics['loss'] = loss.mean().item()
+            batch_metrics_history.append(batch_metrics)
+            running_metrics = self.evaluator._aggregate_metrics(batch_metrics_history)
+            batch_progress.set_postfix(_progress_postfix(running_metrics, include_loss=True))
+
         self.scheduler.step()
-        
-        # Average metrics
-        num_batches = len(train_loader)
-        for key in epoch_metrics:
-            epoch_metrics[key] /= num_batches
-            
+
+        epoch_metrics = self.evaluator._aggregate_metrics(batch_metrics_history)
+        epoch_time = time.perf_counter() - epoch_start
+        epoch_metrics.update({
+            'epoch_time_seconds': epoch_time,
+            'samples_per_second': epoch_metrics.get('num_samples', 0) / max(epoch_time, 1e-12),
+            'learning_rate': learning_rate,
+            'num_batches': len(train_loader),
+        })
         return epoch_metrics
     
     def _initialize_params(self) -> None:
@@ -340,7 +418,37 @@ class Trainer:
             for m in self.model.modules():
                 if isinstance(m, nn.Dropout):
                     m.p = 0
-    
+
+    def _start_metric_logging(self) -> None:
+        """Initialize in-memory history and the interruption-safe JSONL log."""
+        self.metric_history = []
+        if not self.save_dir:
+            return
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        filename = f"metrics_seed{self.config.get('seed', 'N_A')}.jsonl"
+        self.metrics_jsonl_path = os.path.join(self.save_dir, filename)
+        with open(self.metrics_jsonl_path, 'w', encoding='utf-8'):
+            pass
+
+    def _record_metrics(self, split: str, metrics: Dict[str, Any], **context: Any) -> Dict[str, Any]:
+        """Record one timestamped metric snapshot in memory and on disk."""
+        record = _json_safe({
+            'split': split,
+            'timestamp': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'seed': self.config.get('seed'),
+            'method': self.method,
+            'problem_type': self.config.get('prob_type'),
+            'problem_name': self.config.get('prob_name'),
+            'feasibility_tolerance': self.evaluator.feasibility_tol,
+            **context,
+            **metrics,
+        })
+        self.metric_history.append(record)
+        if self.metrics_jsonl_path:
+            with open(self.metrics_jsonl_path, 'a', encoding='utf-8') as file:
+                file.write(json.dumps(record, allow_nan=False) + '\n')
+        return record
  
     def train(self):
         """Main training loop with detailed results collection."""
@@ -364,45 +472,60 @@ class Trainer:
             self.model.parameters(), 
             lr=self.config['lr'], 
             weight_decay=0.001, 
-            fused=True
+            fused=DEVICE.type == 'cuda'
         )
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer, 
             step_size=self.config['lr_decay_step'], 
             gamma=self.config['lr_decay']
         )
-        
+
+        self._start_metric_logging()
+
         # Training history
         train_history = []
         val_history = []
 
-        train_start = time.time()
-        for epoch in range(self.config['num_epochs']):
+        train_start = time.perf_counter()
+        progress_enabled = self.config.get('progress_bar', True)
+        epoch_progress = tqdm(
+            range(self.config['num_epochs']),
+            desc="Training",
+            unit="epoch",
+            dynamic_ncols=True,
+            disable=not progress_enabled,
+        )
+        for epoch in epoch_progress:
             self._update_epoch_params(epoch)
-            epoch_start = time.time()
-            
+
             # Train for one epoch
-            self.model.train()
             epoch_metrics = self.train_epoch(train_loader, epoch)
-            train_history.append({'epoch': epoch, **epoch_metrics})
-            epoch_end = time.time()
-       
-            # Log metrics
-            print(f"Epoch {epoch + 1}/{self.config['num_epochs']}, "
-                  f"Loss: {epoch_metrics['loss']:.4f}, "
-                  f"Obj: {epoch_metrics.get('obj', 0):.4f}, "
-                  f"Eq Viol (l1): {epoch_metrics.get('eq_violation_l1', 0):.6f}, "
-                  f"Ineq Viol (l1): {epoch_metrics.get('ineq_violation_l1', 0):.6f}, "
-                  f"Epoch time: {epoch_end - epoch_start:.2f}s")
+            elapsed_time = time.perf_counter() - train_start
+            train_record = self._record_metrics(
+                'train',
+                epoch_metrics,
+                epoch=epoch,
+                epoch_number=epoch + 1,
+                elapsed_time_seconds=elapsed_time,
+            )
+            train_history.append(train_record)
+            epoch_postfix = _progress_postfix(epoch_metrics, include_loss=True)
+            epoch_postfix['time'] = f"{elapsed_time:.1f}s"
+            epoch_progress.set_postfix(epoch_postfix)
 
             # Evaluate on validation set
             if (epoch + 1) % self.config['eval_step'] == 0:
-                print(f"\nRunning validation at epoch {epoch + 1}...")
                 val_metrics = self.evaluator.evaluate(self.model, val_loader, f"validation_epoch_{epoch+1}")
-                val_history.append({**val_metrics, 'epoch': epoch})
-        
-        train_end = time.time()
-        training_time = train_end - train_start
+                val_record = self._record_metrics(
+                    'validation',
+                    val_metrics,
+                    epoch=epoch,
+                    epoch_number=epoch + 1,
+                    elapsed_time_seconds=time.perf_counter() - train_start,
+                )
+                val_history.append(val_record)
+
+        training_time = time.perf_counter() - train_start
         print(f"\nTraining completed in {training_time:.2f} seconds.")
 
         # Enhanced test evaluation with multiple batch sizes and detailed results
@@ -412,7 +535,9 @@ class Trainer:
             print("="*60)
             
             # Get test batch sizes from config or use defaults
-            test_batch_sizes = self.config.get('test_batch_sizes', [256, 512])
+            test_batch_sizes = self.config.get(
+                'test_batch_sizes', self.config.get('test_batch_size', [256, 512])
+            )
             
             print(f"Testing with batch sizes: {test_batch_sizes}")
             
@@ -429,6 +554,14 @@ class Trainer:
                 'batch_size_comparison': batch_size_results,
                 'detailed_results_all_batch_sizes': all_detailed_results
             }
+            for batch_size, result in batch_size_results.items():
+                if 'metrics' in result:
+                    self._record_metrics(
+                        'test',
+                        result['metrics'],
+                        batch_size=int(batch_size),
+                        elapsed_time_seconds=time.perf_counter() - train_start,
+                    )
         else:
             print("No test dataset available")
             final_test_results = {}
@@ -480,6 +613,7 @@ class Trainer:
             'training_time_seconds': training_time,
             'train_history': train_history,
             'val_history': val_history,
+            'metric_history': self.metric_history,
             'test_results': test_results_data, # This contains summary and detailed results
             'pytorch_version': torch.__version__,
             'device_used': str(DEVICE)
@@ -494,9 +628,32 @@ class Trainer:
         except Exception as e:
             print(f"✗ Error saving results: {e}")
 
+        # --- 3. Save portable metrics history (.json) ---
+        metrics_filename = f"metrics_seed{self.config.get('seed', 'N_A')}.json"
+        metrics_filepath = os.path.join(self.save_dir, metrics_filename)
+        metrics_save_content = _json_safe({
+            'seed': self.config.get('seed', 'N_A'),
+            'method': self.method,
+            'problem_type': self.config.get('prob_type'),
+            'problem_name': self.config.get('prob_name'),
+            'feasibility_tolerance': self.evaluator.feasibility_tol,
+            'optimality_gap_epsilon': self.evaluator.optimality_gap_epsilon,
+            'device_used': str(DEVICE),
+            'records': self.metric_history,
+        })
+        try:
+            with open(metrics_filepath, 'w', encoding='utf-8') as file:
+                json.dump(metrics_save_content, file, indent=2, allow_nan=False)
+            print(f"Metrics history saved: {metrics_filepath}")
+        except Exception as e:
+            print(f"Error saving metrics history: {e}")
+
         print(f"\nFiles saved (or attempted):")
         print(f"  - {model_filename} (model weights and architecture)")
         print(f"  - {results_filename} (training history, metrics, detailed test results)")
+        print(f"  - {metrics_filename} (portable metric history)")
+        if self.metrics_jsonl_path:
+            print(f"  - {os.path.basename(self.metrics_jsonl_path)} (incremental metric history)")
 
 
 
@@ -510,6 +667,8 @@ class Evaluator:
         self.method = method
         self.config = config
         self.config_method = config[method]
+        self.feasibility_tol = float(config.get('feasibility_tol', 1e-5))
+        self.optimality_gap_epsilon = float(config.get('optimality_gap_epsilon', 1e-8))
     
     @torch.no_grad()
     def evaluate(self, model, data_loader, split_name="eval", return_detailed=False):
@@ -529,13 +688,24 @@ class Evaluator:
         all_metrics = []
         detailed_results = [] if return_detailed else None
         
-        total_time = 0
-        
-        for batch_idx, (X_batch, Y_true) in enumerate(data_loader):
+        total_time = 0.0
+        progress_enabled = self.config.get('progress_bar', True)
+        evaluation_progress = tqdm(
+            data_loader,
+            desc=split_name,
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+            disable=not progress_enabled,
+        )
+
+        for X_batch, Y_true in evaluation_progress:
             X_batch = X_batch.to(DEVICE)
             Y_true = Y_true.to(DEVICE)
-            
-            start_time = time.time()
+
+            if DEVICE.type == 'cuda':
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
             
             # Forward pass
             Y_pred = model(X_batch)
@@ -543,14 +713,19 @@ class Evaluator:
             
             # Method-specific post-processing
             Y_final = self._post_process_predictions(X_batch, Y_pred_scaled)
-            
-            batch_time = time.time() - start_time
+
+            if DEVICE.type == 'cuda':
+                torch.cuda.synchronize()
+            batch_time = time.perf_counter() - start_time
             total_time += batch_time
             
             # Compute comprehensive metrics
             batch_metrics = self._compute_batch_metrics(X_batch, Y_final, Y_true)
             batch_metrics['inference_time'] = batch_time
             all_metrics.append(batch_metrics)
+            running_metrics = self._aggregate_metrics(all_metrics)
+            running_metrics['elapsed_time_seconds'] = total_time
+            evaluation_progress.set_postfix(_progress_postfix(running_metrics))
             
             # Store detailed results if requested
             if return_detailed:
@@ -566,7 +741,14 @@ class Evaluator:
         # Aggregate metrics
         aggregated_metrics = self._aggregate_metrics(all_metrics)
         aggregated_metrics['total_time'] = total_time
-        aggregated_metrics['avg_inference_time'] = total_time / len(data_loader)
+        aggregated_metrics['avg_inference_time'] = total_time / max(len(data_loader), 1)
+        aggregated_metrics['avg_inference_time_per_sample'] = (
+            total_time / max(aggregated_metrics.get('num_samples', 0), 1)
+        )
+        aggregated_metrics['samples_per_second'] = (
+            aggregated_metrics.get('num_samples', 0) / max(total_time, 1e-12)
+        )
+        aggregated_metrics['num_batches'] = len(data_loader)
         
         # Print summary
         self._print_evaluation_summary(split_name, aggregated_metrics)
@@ -613,19 +795,44 @@ class Evaluator:
         eq_violation_max = eq_resid.abs().max(dim=1)[0]
         ineq_violation_max = ineq_resid.abs().max(dim=1)[0]
         
-        # Optimality gap
-        opt_gap = (obj_pred - obj_true) / obj_true.abs()         
+        # Optimality gap. The clamped denominator avoids inf/nan near zero.
+        objective_gap = obj_pred - obj_true
+        denominator = obj_true.abs().clamp_min(
+            max(self.optimality_gap_epsilon, torch.finfo(obj_true.dtype).eps)
+        )
+        opt_gap = objective_gap / denominator
+        absolute_opt_gap = opt_gap.abs()
+        absolute_objective_gap = objective_gap.abs()
         # Solution distance
         solution_distance = torch.norm(Y_final - Y_true, dim=1).square()
+
+        eq_feasible = eq_violation_max <= self.feasibility_tol
+        ineq_feasible = ineq_violation_max <= self.feasibility_tol
+        feasible = eq_feasible & ineq_feasible
         
         return {
             # Objective metrics
             'objective': obj_pred.mean().item(),
             'true_objective': obj_true.mean().item(),
+            'objective_gap_mean': objective_gap.mean().item(),
+            'objective_gap_std': objective_gap.std(unbiased=False).item(),
+            'objective_gap_max': objective_gap.max().item(),
+            'objective_gap_min': objective_gap.min().item(),
+            'absolute_objective_gap_mean': absolute_objective_gap.mean().item(),
+            'absolute_objective_gap_std': absolute_objective_gap.std(unbiased=False).item(),
+            'absolute_objective_gap_max': absolute_objective_gap.max().item(),
             'opt_gap_mean': opt_gap.mean().item(),
-            'opt_gap_std': opt_gap.std().item(),
+            'opt_gap_std': opt_gap.std(unbiased=False).item(),
             'opt_gap_max': opt_gap.max().item(),
             'opt_gap_min': opt_gap.min().item(),
+            'absolute_opt_gap_mean': absolute_opt_gap.mean().item(),
+            'absolute_opt_gap_std': absolute_opt_gap.std(unbiased=False).item(),
+            'absolute_opt_gap_max': absolute_opt_gap.max().item(),
+
+            # Feasibility rates at the configured tolerance
+            'feasibility_rate': feasible.double().mean().item(),
+            'eq_feasibility_rate': eq_feasible.double().mean().item(),
+            'ineq_feasibility_rate': ineq_feasible.double().mean().item(),
             
             # Constraint violations (L2)
             'eq_violation_l2_mean': eq_violation_l2.mean().item(),
@@ -647,8 +854,9 @@ class Evaluator:
             
             # Solution quality
             'solution_distance_mean': solution_distance.mean().item(),
-            'solution_distance_std': solution_distance.std().item(),
+            'solution_distance_std': solution_distance.std(unbiased=False).item(),
             'solution_distance_max': solution_distance.max().item(),
+            'num_samples': X_batch.shape[0],
         }
     
     def _aggregate_metrics(self, all_metrics):
@@ -656,16 +864,40 @@ class Evaluator:
         if not all_metrics:
             return {}
         
-        keys = all_metrics[0].keys() - {'inference_time'}
+        keys = set().union(*(metrics.keys() for metrics in all_metrics)) - {'inference_time'}
         aggregated = {}
-        
+        total_samples = sum(metrics.get('num_samples', 1) for metrics in all_metrics)
+
         for key in keys:
-            values = [m[key] for m in all_metrics]
+            if key == 'num_samples':
+                aggregated[key] = total_samples
+                continue
+
+            metrics_with_key = [metrics for metrics in all_metrics if key in metrics]
+            values = [metrics[key] for metrics in metrics_with_key]
             if key.endswith('_std'):
-                # For std metrics, compute overall std
-                aggregated[key] = np.std([m[key.replace('_std', '_mean')] for m in all_metrics])
+                mean_key = key.replace('_std', '_mean')
+                weighted_count = sum(metrics.get('num_samples', 1) for metrics in metrics_with_key)
+                mean = sum(
+                    metrics.get('num_samples', 1) * metrics[mean_key]
+                    for metrics in metrics_with_key
+                ) / max(weighted_count, 1)
+                second_moment = sum(
+                    metrics.get('num_samples', 1)
+                    * (metrics[key] ** 2 + metrics[mean_key] ** 2)
+                    for metrics in metrics_with_key
+                ) / max(weighted_count, 1)
+                aggregated[key] = float(np.sqrt(max(second_moment - mean ** 2, 0.0)))
+            elif key.endswith('_max'):
+                aggregated[key] = max(values)
+            elif key.endswith('_min'):
+                aggregated[key] = min(values)
             else:
-                aggregated[key] = np.mean(values)
+                weighted_count = sum(metrics.get('num_samples', 1) for metrics in metrics_with_key)
+                aggregated[key] = sum(
+                    metrics.get('num_samples', 1) * metrics[key]
+                    for metrics in metrics_with_key
+                ) / max(weighted_count, 1)
         
         return aggregated
     
@@ -675,11 +907,16 @@ class Evaluator:
         print("=" * 50)
         print(f"Objective Value:     {metrics.get('objective', 0):.6e}")
         print(f"True Objective:      {metrics.get('true_objective', 0):.6e}")
-        print(f"Optimality Gap:      {metrics.get('opt_gap_mean', 0):.6e} ± {metrics.get('opt_gap_std', 0):.6e}")
+        print(f"Objective Gap:       {metrics.get('objective_gap_mean', 0):.6e} ± {metrics.get('objective_gap_std', 0):.6e}")
+        print(f"Relative Opt Gap:    {metrics.get('opt_gap_mean', 0):.6e} ± {metrics.get('opt_gap_std', 0):.6e}")
+        print(f"Feasibility Rate:    {100 * metrics.get('feasibility_rate', 0):.2f}% (tol={self.feasibility_tol:.1e})")
+        print(f"Eq Feasibility:      {100 * metrics.get('eq_feasibility_rate', 0):.2f}%")
+        print(f"Ineq Feasibility:    {100 * metrics.get('ineq_feasibility_rate', 0):.2f}%")
         print(f"Eq Violation l1:   {metrics.get('eq_violation_l1_mean', 0):.6e} (max: {metrics.get('eq_violation_l1_max', 0):.6e})")
         print(f"Ineq Violation l1: {metrics.get('ineq_violation_l1_mean', 0):.6e} (max: {metrics.get('ineq_violation_l1_max', 0):.6e})")
         print(f"Solution Distance:   {metrics.get('solution_distance_mean', 0):.6e} ± {metrics.get('solution_distance_std', 0):.6e}")
         print(f"Avg Inference Time:  {metrics.get('avg_inference_time', 0):.4f}s")
+        print(f"Throughput:          {metrics.get('samples_per_second', 0):.2f} samples/s")
         print("=" * 50)
     
     def evaluate_multiple_batch_sizes(self, model, dataset, batch_sizes, split_name="test"):
@@ -745,25 +982,22 @@ class Evaluator:
     def _print_batch_size_comparison(self, results, split_name):
         """Print comparison of results across batch sizes."""
         print(f"\n{split_name.upper()} BATCH SIZE COMPARISON:")
-        print("=" * 80)
-        print(f"{'Batch Size':<12} {'Objective':<12} {'Opt Gap':<12} {'Eq Viol':<12} {'Ineq Viol':<12} {'Time (s)':<10}")
-        print("-" * 80)
+        print("=" * 92)
+        print(f"{'Batch Size':<12} {'Objective':<12} {'Opt Gap':<12} {'Feas (%)':<10} {'Eq Viol':<12} {'Ineq Viol':<12} {'Time (s)':<10}")
+        print("-" * 92)
         
         for batch_size, result in results.items():
             if 'error' in result:
-                print(f"{batch_size:<12} {'OOM':<12} {'OOM':<12} {'OOM':<12} {'OOM':<12} {'OOM':<10}")
+                print(f"{batch_size:<12} {'OOM':<12} {'OOM':<12} {'OOM':<10} {'OOM':<12} {'OOM':<12} {'OOM':<10}")
             else:
                 metrics = result['metrics']
                 print(f"{batch_size:<12} "
                       f"{metrics.get('objective', 0):<12.4e} "
                       f"{metrics.get('opt_gap_mean', 0):<12.4e} "
+                      f"{100 * metrics.get('feasibility_rate', 0):<10.2f} "
                       f"{metrics.get('eq_violation_l1_mean', 0):<12.4e} "
                       f"{metrics.get('ineq_violation_l1_mean', 0):<12.4e} "
                       f"{metrics.get('total_time', 0):<10.2f}")
         
-        print("=" * 80)
+        print("=" * 92)
         
-
-
-
-

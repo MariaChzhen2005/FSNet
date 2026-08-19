@@ -66,6 +66,22 @@ python main.py \
 Example:
 ```bash
 python main.py --method FSNet --prob_type convex --prob_name qp
+python main.py --method FSNet --prob_type nonconvex --prob_name qp
 python main.py --method FSNet --prob_type nonconvex --prob_name socp --dropout 0.1
 
 ```
+
+Training and evaluation use `tqdm` progress bars for loss, objective value,
+relative optimality gap, feasibility rate, constraint violations, and elapsed
+time. History records include both raw and relative objective gaps. The
+feasibility rate uses `feasibility_tol` from the config (default `1e-5`) and can
+be overridden with `--feasibility_tol`.
+
+Each run writes metrics under its result directory in two portable formats:
+
+* `metrics_seed<seed>.jsonl` is updated after every train, validation, and test
+  phase, so partial results remain available if a run is interrupted.
+* `metrics_seed<seed>.json` contains the consolidated history after the run.
+
+The existing `results_seed<seed>.pkl` also contains the complete metric history
+and detailed test predictions.

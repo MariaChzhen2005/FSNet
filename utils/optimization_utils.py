@@ -5,7 +5,10 @@ from torch.utils.data import TensorDataset, random_split
 import cvxpy as cp
 # from cvxpylayers.torch import CvxpyLayer
 import casadi as ca
-from qpth.qp import QPFunction
+try:
+    from qpth.qp import QPFunction
+except ImportError:
+    QPFunction = None
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 torch.set_default_dtype(torch.float64)
@@ -160,6 +163,11 @@ class QPProblem(BaseProblem):
         return Y_full   
     
     def qpth_projection(self, X, Y):
+        if QPFunction is None:
+            raise ImportError(
+                "Projection mode requires qpth. Install the project requirements "
+                "or run `pip install qpth`."
+            )
         batch_size = X.shape[0]
         n = self.ydim
         device = X.device
@@ -405,4 +413,3 @@ def grad_steps(data, X, Y, config):
         old_Y_step = new_Y_step
 
     return Y_new
-
