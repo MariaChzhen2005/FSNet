@@ -95,6 +95,9 @@ backbones on the nonsmooth nonconvex SOCP dataset with one command:
 python compute_weight_to_merit_landscape_random.py all
 ```
 
+The residual MLP uses post-activation blocks: each skip sum is passed through
+SiLU before it enters the next hidden layer.
+
 The default landscape configuration uses training seed `2025`, matched random
 direction seeds `0 1 2 3 4`, a detailed `31 x 31` grid of actual merit
 evaluations per surface, 300-DPI rendering, filter-normalized directions over

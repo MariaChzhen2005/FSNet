@@ -103,7 +103,7 @@ class ICNN(nn.Module):
 
 
 class ResidualMLP(nn.Module):
-    """MLP with additive skips across its width-preserving hidden layers."""
+    """Post-activation MLP with skips across width-preserving hidden layers."""
 
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=1, dropout=0.0):
         super().__init__()
@@ -118,12 +118,15 @@ class ResidualMLP(nn.Module):
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.residual_scale = 1.0 / math.sqrt(max(1, num_layers - 1))
 
-    def forward(self, x):
+    def forward_features(self, x):
         hidden = F.silu(self.input_layer(x))
         for layer in self.residual_layers:
             update = self.dropout(F.silu(layer(hidden)))
-            hidden = hidden + self.residual_scale * update
-        return torch.sigmoid(self.output_layer(hidden))
+            hidden = F.silu(hidden + self.residual_scale * update)
+        return hidden
+
+    def forward(self, x):
+        return torch.sigmoid(self.output_layer(self.forward_features(x)))
 
 
 # Short CLI-friendly alias used by the landscape ablation.
@@ -134,6 +137,13 @@ NETWORK_CLASSES = {
     "ICNN": ICNN,
     "ResMLP": ResidualMLP,
     "ResidualMLP": ResidualMLP,
+}
+
+NETWORK_IMPLEMENTATION_VERSIONS = {
+    "MLP": 1,
+    "ICNN": 1,
+    "ResMLP": 2,
+    "ResidualMLP": 2,
 }
 
 

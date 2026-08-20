@@ -59,6 +59,22 @@ class ArchitectureAblationTest(unittest.TestCase):
         for layer in nonnegative_layers:
             self.assertTrue(torch.all(layer.weight >= 0))
 
+    def test_residual_mlp_activates_each_residual_sum(self):
+        model = ResidualMLP(2, 2, 1, num_layers=2).double()
+        with torch.no_grad():
+            model.input_layer.weight.copy_(torch.eye(2))
+            model.input_layer.bias.zero_()
+            model.residual_layers[0].weight.copy_(torch.eye(2))
+            model.residual_layers[0].bias.zero_()
+
+        inputs = torch.tensor([[1.0, -1.0]], dtype=torch.double)
+        first_hidden = torch.nn.functional.silu(inputs)
+        residual_update = torch.nn.functional.silu(first_hidden)
+        expected = torch.nn.functional.silu(
+            first_hidden + model.residual_scale * residual_update
+        )
+        torch.testing.assert_close(model.forward_features(inputs), expected)
+
     def test_cli_defaults_cover_three_models_and_five_matched_seeds(self):
         args = create_parser().parse_args(["all"])
         self.assertEqual(tuple(args.architectures), ARCHITECTURES)

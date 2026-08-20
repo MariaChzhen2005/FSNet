@@ -37,6 +37,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
+from models.neural_networks import NETWORK_IMPLEMENTATION_VERSIONS
 from utils.trainer import Evaluator, Trainer, create_model, load_instance
 
 
@@ -69,6 +70,9 @@ def build_config(base_config: Mapping, args: argparse.Namespace, architecture: s
             "network": architecture,
             "hidden_dim": HIDDEN_DIM,
             "num_layers": NUM_LAYERS,
+            "network_implementation_version": NETWORK_IMPLEMENTATION_VERSIONS[
+                architecture
+            ],
             "ablation": False,
             "progress_bar": not args.no_progress_bar,
         }
@@ -95,12 +99,14 @@ def build_config(base_config: Mapping, args: argparse.Namespace, architecture: s
 
 def checkpoint_directory(args: argparse.Namespace, architecture: str) -> Path:
     problem_size = "-".join(str(value) for value in args.prob_size)
+    implementation_version = NETWORK_IMPLEMENTATION_VERSIONS[architecture]
+    version_suffix = "" if implementation_version == 1 else f"_v{implementation_version}"
     return (
         Path(args.checkpoint_root)
         / args.prob_type
         / args.prob_name
         / problem_size
-        / f"{architecture}_{NUM_LAYERS}x{HIDDEN_DIM}"
+        / f"{architecture}_{NUM_LAYERS}x{HIDDEN_DIM}{version_suffix}"
         / f"train_seed{args.training_seed}"
     )
 
@@ -137,6 +143,16 @@ def validate_checkpoint(
         for key, value in expected.items()
         if config.get(key) != value
     }
+    expected_network_version = NETWORK_IMPLEMENTATION_VERSIONS[architecture]
+    # Checkpoints created before implementation versions were recorded used
+    # version 1. This preserves valid MLP/ICNN checkpoints while forcing old
+    # residual checkpoints to be retrained for the post-activation definition.
+    actual_network_version = config.get("network_implementation_version", 1)
+    if actual_network_version != expected_network_version:
+        mismatches["network_implementation_version"] = (
+            actual_network_version,
+            expected_network_version,
+        )
     expected_fsnet = expected_config["FSNet"]
     actual_fsnet = config.get("FSNet", {})
     # val_tol is intentionally omitted: the current trainer decays and mutates
@@ -449,6 +465,9 @@ def save_surface(
         checkpoint_sha256=checkpoint_digest,
         evaluation_signature=eval_signature,
         landscape_format_version=LANDSCAPE_FORMAT_VERSION,
+        network_implementation_version=NETWORK_IMPLEMENTATION_VERSIONS[
+            architecture
+        ],
     )
 
 
@@ -472,9 +491,14 @@ def cached_surface_matches(
         "checkpoint_sha256": checkpoint_digest,
         "evaluation_signature": eval_signature,
         "landscape_format_version": LANDSCAPE_FORMAT_VERSION,
+        "network_implementation_version": NETWORK_IMPLEMENTATION_VERSIONS[
+            architecture
+        ],
     }
     for key, expected_value in expected.items():
         if key not in surface:
+            if key == "network_implementation_version" and expected_value == 1:
+                continue
             return False
         actual = surface[key].item()
         if isinstance(expected_value, float):
@@ -816,6 +840,10 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
         "device": str(DEVICE),
         "evaluation_signature": eval_signature,
         "landscape_format_version": LANDSCAPE_FORMAT_VERSION,
+        "network_implementation_versions": {
+            architecture: NETWORK_IMPLEMENTATION_VERSIONS[architecture]
+            for architecture in args.architectures
+        },
         **plot_metadata,
         "surface_statistics": {
             f"{architecture}/direction_seed{seed}": surface_statistics(
