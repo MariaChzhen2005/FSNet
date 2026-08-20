@@ -4,11 +4,13 @@ The three commands are:
 
 * ``train``: train missing architecture checkpoints.
 * ``visualize``: compute/plot landscapes from existing checkpoints.
+* ``plot``: render existing ``.npz`` surfaces without model checkpoints.
 * ``all``: train missing checkpoints and then visualize all landscapes.
 
 All architectures use four hidden layers of width 64. Landscape direction
-seeds, evaluation examples, perturbation radius, and color normalization are
-shared across architectures so that corresponding plots are comparable.
+seeds, evaluation examples, and perturbation radius are shared across
+architectures. Plots can use either a global scale or an architecture-local
+raw-value scale.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # Keep Matplotlib's cache inside a writable temporary location on managed or
 # headless systems where the user's normal config directory may be read-only.
@@ -43,6 +45,9 @@ from utils.trainer import Evaluator, Trainer, create_model, load_instance
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 ARCHITECTURES = ("MLP", "ICNN", "ResMLP")
+SURFACE_METRICS = ("merit", "loss")
+PLOT_SCALES = ("global", "local")
+VALUE_TRANSFORMS = ("raw", "log10", "both")
 HIDDEN_DIM = 64
 NUM_LAYERS = 4
 DEFAULT_DIRECTION_SEEDS = (0, 1, 2, 3, 4)
@@ -346,6 +351,39 @@ def merit_values(
     )
 
 
+def fsnet_loss_values(
+    problem,
+    input_batch: torch.Tensor,
+    scaled_prediction: torch.Tensor,
+    final_prediction: torch.Tensor,
+    *,
+    objective_weight: float,
+    distance_weight: float,
+    equality_weight: float,
+    inequality_weight: float,
+) -> torch.Tensor:
+    """Return FSNet evaluation-loss values for each example.
+
+    Constraint penalties are measured before feasibility refinement, while the
+    objective and refinement-distance terms use the refined prediction. This
+    matches ``utils.evaluator.Evaluator.evaluate_loss``.
+    """
+    objective = problem.obj_fn(final_prediction)
+    distance = (final_prediction - scaled_prediction).square().sum(dim=1)
+    equality_violation = problem.eq_resid(
+        input_batch, scaled_prediction
+    ).square().sum(dim=1)
+    inequality_violation = problem.ineq_resid(
+        input_batch, scaled_prediction
+    ).square().sum(dim=1)
+    return (
+        objective_weight * objective
+        + distance_weight * distance
+        + equality_weight * equality_violation
+        + inequality_weight * inequality_violation
+    )
+
+
 def make_merit_evaluator(
     problem,
     config: Mapping,
@@ -379,6 +417,60 @@ def make_merit_evaluator(
         return total_merit / max(1, total_samples)
 
     return evaluate_merit
+
+
+def make_loss_evaluator(
+    problem,
+    config: Mapping,
+    loss_penalty_weight: float | None,
+) -> Tuple[Callable[[torch.nn.Module, DataLoader], float], dict]:
+    evaluator = Evaluator(problem, "FSNet", config)
+    fsnet_config = config["FSNet"]
+    equality_weight = (
+        loss_penalty_weight
+        if loss_penalty_weight is not None
+        else float(fsnet_config["eq_pen_weight"])
+    )
+    inequality_weight = (
+        loss_penalty_weight
+        if loss_penalty_weight is not None
+        else float(fsnet_config["ineq_pen_weight"])
+    )
+    loss_metadata = {
+        "objective_weight": float(fsnet_config["obj_weight"]),
+        "distance_weight": float(fsnet_config["dist_weight"]),
+        "equality_penalty_weight": equality_weight,
+        "inequality_penalty_weight": inequality_weight,
+        "loss_definition_version": 1,
+    }
+
+    @torch.no_grad()
+    def evaluate_loss(model: torch.nn.Module, data_loader: DataLoader) -> float:
+        model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        for input_batch, _target_batch in data_loader:
+            input_batch = input_batch.to(DEVICE, non_blocking=True)
+            prediction = model(input_batch)
+            scaled_prediction = problem.scale(prediction)
+            final_prediction = evaluator._post_process_predictions(
+                input_batch, scaled_prediction
+            )
+            loss = fsnet_loss_values(
+                problem,
+                input_batch,
+                scaled_prediction,
+                final_prediction,
+                objective_weight=loss_metadata["objective_weight"],
+                distance_weight=loss_metadata["distance_weight"],
+                equality_weight=loss_metadata["equality_penalty_weight"],
+                inequality_weight=loss_metadata["inequality_penalty_weight"],
+            )
+            total_loss += loss.sum().item()
+            total_samples += input_batch.shape[0]
+        return total_loss / max(1, total_samples)
+
+    return evaluate_loss, loss_metadata
 
 
 @torch.no_grad()
@@ -432,8 +524,15 @@ def compute_merit_surface_2d(
     return x_grid, y_grid, merit
 
 
-def surface_path(output_dir: Path, architecture: str, direction_seed: int) -> Path:
-    return output_dir / f"merit_landscape_{architecture}_direction_seed{direction_seed}.npz"
+def surface_path(
+    output_dir: Path,
+    architecture: str,
+    direction_seed: int,
+    surface_metric: str = "merit",
+) -> Path:
+    return output_dir / (
+        f"{surface_metric}_landscape_{architecture}_direction_seed{direction_seed}.npz"
+    )
 
 
 def save_surface(
@@ -446,7 +545,12 @@ def save_surface(
     direction_seed: int,
     checkpoint_digest: str,
     eval_signature: str,
+    metric_metadata: Mapping,
 ) -> None:
+    metadata = {
+        "surface_metric": args.surface_metric,
+        **metric_metadata,
+    }
     np.savez_compressed(
         path,
         X=x_grid,
@@ -468,6 +572,7 @@ def save_surface(
         network_implementation_version=NETWORK_IMPLEMENTATION_VERSIONS[
             architecture
         ],
+        **metadata,
     )
 
 
@@ -478,12 +583,12 @@ def cached_surface_matches(
     direction_seed: int,
     checkpoint_digest: str,
     eval_signature: str,
+    metric_metadata: Mapping,
 ) -> bool:
     expected = {
         "architecture": architecture,
         "training_seed": args.training_seed,
         "direction_seed": direction_seed,
-        "penalty_weight": args.penalty_weight,
         "radius": args.radius,
         "grid_size": args.grid_size,
         "direction_norm": args.direction_norm,
@@ -494,10 +599,16 @@ def cached_surface_matches(
         "network_implementation_version": NETWORK_IMPLEMENTATION_VERSIONS[
             architecture
         ],
+        "surface_metric": args.surface_metric,
+        **metric_metadata,
     }
+    if args.surface_metric == "merit":
+        expected["penalty_weight"] = args.penalty_weight
     for key, expected_value in expected.items():
         if key not in surface:
             if key == "network_implementation_version" and expected_value == 1:
+                continue
+            if key == "surface_metric" and expected_value == "merit":
                 continue
             return False
         actual = surface[key].item()
@@ -535,9 +646,10 @@ def draw_surface(
     title: str,
     elevation: float,
     azimuth: float,
+    value_label: str,
 ):
-    raw_merit = surface["Z"]
-    plot_values = np.ma.masked_invalid(raw_merit)
+    plot_array = surface["Z"]
+    plot_values = np.ma.masked_invalid(plot_array)
     surface_plot = axis.plot_surface(
         surface["X"],
         surface["Y"],
@@ -551,7 +663,7 @@ def draw_surface(
         antialiased=True,
         shade=True,
     )
-    center = raw_merit[raw_merit.shape[0] // 2, raw_merit.shape[1] // 2]
+    center = plot_array[plot_array.shape[0] // 2, plot_array.shape[1] // 2]
     if np.isfinite(center):
         axis.scatter(
             [0.0],
@@ -559,14 +671,14 @@ def draw_surface(
             [center],
             color="red",
             marker="x",
-            s=35,
+            s=42,
             linewidths=1.8,
             depthshade=False,
         )
     axis.set_title(title)
     axis.set_xlabel("direction 1")
     axis.set_ylabel("direction 2")
-    axis.set_zlabel("raw merit")
+    axis.set_zlabel(value_label)
     axis.set_xlim(float(surface["X"].min()), float(surface["X"].max()))
     axis.set_ylim(float(surface["Y"].min()), float(surface["Y"].max()))
     axis.set_zlim(color_minimum, color_maximum)
@@ -589,23 +701,122 @@ def save_figure(figure, path: Path, dpi: int) -> None:
     )
 
 
-def plot_surfaces(
+def compact_scientific(value: float) -> str:
+    """Format a numeric setting compactly for titles and safe filenames."""
+    if value == 0:
+        return "0"
+    mantissa, exponent = f"{value:.6e}".split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    return f"{mantissa}e{int(exponent)}"
+
+
+def plot_file_prefix(
+    args: argparse.Namespace, value_transform: Optional[str] = None
+) -> str:
+    prefix = f"{args.surface_metric}_landscape"
+    if args.surface_metric == "merit":
+        prefix += f"_rho_merit_{compact_scientific(args.penalty_weight)}"
+    if value_transform == "log10":
+        prefix += "_log10"
+    if args.plot_scale == "local":
+        prefix += "_local"
+    return prefix
+
+
+def merit_penalty_title(args: argparse.Namespace) -> str:
+    if args.surface_metric != "merit":
+        return ""
+    return f"rho_merit = {compact_scientific(args.penalty_weight)}"
+
+
+def transformed_surfaces(
+    surfaces: Mapping[Tuple[str, int], Mapping[str, np.ndarray]],
+    value_transform: str,
+) -> Dict[Tuple[str, int], Dict[str, np.ndarray]]:
+    transformed = {}
+    for key, surface in surfaces.items():
+        raw_values = surface["Z"]
+        if value_transform == "raw":
+            plot_values = raw_values
+        else:
+            finite_values = raw_values[np.isfinite(raw_values)]
+            if finite_values.size and np.any(finite_values <= 0):
+                raise ValueError(
+                    "Unshifted log10 plots require every finite sampled value to "
+                    f"be positive; {key} has minimum {finite_values.min():.6g}."
+                )
+            plot_values = np.full_like(raw_values, np.nan, dtype=np.float64)
+            finite = np.isfinite(raw_values)
+            plot_values[finite] = np.log10(raw_values[finite])
+        transformed[key] = {
+            "X": surface["X"],
+            "Y": surface["Y"],
+            "Z": plot_values,
+            "raw_Z": raw_values,
+        }
+    return transformed
+
+
+def plot_surface_view(
     surfaces: Mapping[Tuple[str, int], Mapping[str, np.ndarray]],
     args: argparse.Namespace,
     output_dir: Path,
+    value_transform: str,
 ) -> dict:
+    metric_label = args.surface_metric
+    plot_scale = args.plot_scale
+    file_prefix = plot_file_prefix(args, value_transform)
+    value_label = (
+        f"raw {metric_label}"
+        if value_transform == "raw"
+        else f"log10(raw {metric_label})"
+    )
     all_values = np.concatenate([surface["Z"].ravel() for surface in surfaces.values()])
     finite_values = all_values[np.isfinite(all_values)]
     if finite_values.size == 0:
         raise ValueError("All computed merit values are non-finite")
     global_minimum = float(finite_values.min())
-    color_minimum = global_minimum
-    color_maximum = float(finite_values.max())
-    if np.isclose(color_minimum, color_maximum):
-        color_maximum = color_minimum + 1.0
-    colorbar_label = "raw merit"
+    global_maximum = float(finite_values.max())
+
+    architecture_ranges = {}
+    for architecture in args.architectures:
+        architecture_values = np.concatenate(
+            [
+                surfaces[(architecture, seed)]["Z"].ravel()
+                for seed in args.direction_seeds
+            ]
+        )
+        architecture_finite = architecture_values[
+            np.isfinite(architecture_values)
+        ]
+        if architecture_finite.size == 0:
+            raise ValueError(f"All {architecture} merit values are non-finite")
+        raw_minimum = float(architecture_finite.min())
+        raw_maximum = float(architecture_finite.max())
+        display_maximum = raw_maximum
+        if np.isclose(raw_minimum, display_maximum):
+            display_maximum = raw_minimum + 1.0
+        architecture_ranges[architecture] = {
+            "minimum": raw_minimum,
+            "maximum": raw_maximum,
+            "display_minimum": raw_minimum,
+            "display_maximum": display_maximum,
+        }
+
+    global_display_maximum = global_maximum
+    if np.isclose(global_minimum, global_display_maximum):
+        global_display_maximum = global_minimum + 1.0
+
+    def display_bounds(architecture: str) -> Tuple[float, float]:
+        if plot_scale == "local":
+            value_range = architecture_ranges[architecture]
+            return value_range["display_minimum"], value_range["display_maximum"]
+        return global_minimum, global_display_maximum
+
+    colorbar_label = value_label
 
     for (architecture, direction_seed), surface in surfaces.items():
+        color_minimum, color_maximum = display_bounds(architecture)
         figure = plt.figure(figsize=(7.2, 5.8), constrained_layout=True)
         axis = figure.add_subplot(111, projection="3d")
         surface_plot = draw_surface(
@@ -616,11 +827,15 @@ def plot_surfaces(
             f"{architecture}, direction seed {direction_seed}",
             args.elevation,
             args.azimuth,
+            value_label,
         )
+        penalty_title = merit_penalty_title(args)
+        if penalty_title:
+            figure.suptitle(penalty_title)
         figure.colorbar(surface_plot, ax=axis, label=colorbar_label, shrink=0.72, pad=0.1)
         save_figure(
             figure,
-            output_dir / f"merit_landscape_{architecture}_direction_seed{direction_seed}.png",
+            output_dir / f"{file_prefix}_{architecture}_direction_seed{direction_seed}.png",
             args.dpi,
         )
         plt.close(figure)
@@ -629,33 +844,56 @@ def plot_surfaces(
         figure, axes = plt.subplots(
             1,
             len(args.architectures),
-            figsize=(5.8 * len(args.architectures), 5.4),
+            figsize=(
+                (6.6 if plot_scale == "local" else 5.8)
+                * len(args.architectures),
+                5.4,
+            ),
             constrained_layout=True,
             squeeze=False,
             subplot_kw={"projection": "3d"},
         )
         surface_plot = None
         for column, architecture in enumerate(args.architectures):
+            color_minimum, color_maximum = display_bounds(architecture)
             surface_plot = draw_surface(
                 axes[0, column],
                 surfaces[(architecture, direction_seed)],
                 color_minimum,
                 color_maximum,
-                architecture,
+                f"{architecture}, direction seed {direction_seed}",
                 args.elevation,
                 args.azimuth,
+                value_label,
             )
-        figure.suptitle(f"Matched FSNet merit landscapes: direction seed {direction_seed}")
-        figure.colorbar(
-            surface_plot,
-            ax=axes.ravel().tolist(),
-            label=colorbar_label,
-            shrink=0.7,
-            pad=0.04,
+            if plot_scale == "local":
+                figure.colorbar(
+                    surface_plot,
+                    ax=axes[0, column],
+                    label=colorbar_label,
+                    shrink=0.7,
+                    pad=0.08,
+                )
+        figure.suptitle(
+            f"Matched FSNet {metric_label} landscapes: direction seed {direction_seed}"
+            + (f" [{value_transform}]" if value_transform != "raw" else "")
+            + (
+                f"; {merit_penalty_title(args)}"
+                if merit_penalty_title(args)
+                else ""
+            )
         )
+        if plot_scale == "global":
+            figure.colorbar(
+                surface_plot,
+                ax=axes.ravel().tolist(),
+                label=colorbar_label,
+                shrink=0.7,
+                pad=0.04,
+            )
         save_figure(
             figure,
-            output_dir / f"merit_landscape_comparison_direction_seed{direction_seed}.png",
+            output_dir / f"{file_prefix}_comparison_direction_seed{direction_seed}.png",
             args.dpi,
         )
         plt.close(figure)
@@ -663,14 +901,19 @@ def plot_surfaces(
     figure, axes = plt.subplots(
         len(args.direction_seeds),
         len(args.architectures),
-        figsize=(5.6 * len(args.architectures), 4.8 * len(args.direction_seeds)),
+        figsize=(
+            (6.2 if plot_scale == "local" else 5.6) * len(args.architectures),
+            4.8 * len(args.direction_seeds),
+        ),
         constrained_layout=True,
         squeeze=False,
         subplot_kw={"projection": "3d"},
     )
     surface_plot = None
+    architecture_plots = {}
     for row, direction_seed in enumerate(args.direction_seeds):
         for column, architecture in enumerate(args.architectures):
+            color_minimum, color_maximum = display_bounds(architecture)
             surface_plot = draw_surface(
                 axes[row, column],
                 surfaces[(architecture, direction_seed)],
@@ -679,34 +922,87 @@ def plot_surfaces(
                 f"{architecture}, direction seed {direction_seed}",
                 args.elevation,
                 args.azimuth,
+                value_label,
             )
+            architecture_plots[architecture] = surface_plot
     figure.suptitle(
-        f"FSNet architecture merit landscapes "
-        f"(penalty weight={args.penalty_weight:g}, train seed={args.training_seed})"
+        f"FSNet architecture {metric_label} landscapes "
+        f"(train seed={args.training_seed})"
+        + (f" [{value_transform}]" if value_transform != "raw" else "")
+        + (
+            f"; {merit_penalty_title(args)}"
+            if merit_penalty_title(args)
+            else ""
+        )
     )
-    figure.colorbar(
-        surface_plot,
-        ax=axes.ravel().tolist(),
-        label=colorbar_label,
-        shrink=0.65,
-        pad=0.025,
-    )
+    if plot_scale == "local":
+        for column, architecture in enumerate(args.architectures):
+            figure.colorbar(
+                architecture_plots[architecture],
+                ax=axes[:, column].ravel().tolist(),
+                label=f"{architecture} {value_label}",
+                shrink=0.65,
+                pad=0.025,
+            )
+    else:
+        figure.colorbar(
+            surface_plot,
+            ax=axes.ravel().tolist(),
+            label=colorbar_label,
+            shrink=0.65,
+            pad=0.025,
+        )
     save_figure(
         figure,
-        output_dir / "merit_landscape_all_comparisons.png",
+        output_dir / f"{file_prefix}_all_comparisons.png",
         args.dpi,
     )
     plt.close(figure)
 
     return {
-        "global_merit_minimum": global_minimum,
-        "global_merit_maximum": float(finite_values.max()),
-        "color_minimum": color_minimum,
-        "color_maximum": color_maximum,
-        "color_transform": "none (raw merit)",
+        "plot_scale": plot_scale,
+        "value_transform": value_transform,
+        "global_value_minimum": global_minimum,
+        "global_value_maximum": global_maximum,
+        "architecture_value_ranges": architecture_ranges,
+        "color_minimum": global_minimum if plot_scale == "global" else None,
+        "color_maximum": (
+            global_display_maximum if plot_scale == "global" else None
+        ),
+        "color_transform": (
+            f"none (raw {metric_label})"
+            if value_transform == "raw"
+            else f"log10(raw {metric_label}), unshifted"
+        ),
         "plot_projection": "3d",
         "view_elevation": args.elevation,
         "view_azimuth": args.azimuth,
+    }
+
+
+def plot_surfaces(
+    surfaces: Mapping[Tuple[str, int], Mapping[str, np.ndarray]],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> dict:
+    requested_transforms = (
+        ("raw", "log10")
+        if args.value_transform == "both"
+        else (args.value_transform,)
+    )
+    view_metadata = {}
+    for value_transform in requested_transforms:
+        view_metadata[value_transform] = plot_surface_view(
+            transformed_surfaces(surfaces, value_transform),
+            args,
+            output_dir,
+            value_transform,
+        )
+    primary_metadata = view_metadata[requested_transforms[0]]
+    return {
+        **primary_metadata,
+        "value_transforms": list(requested_transforms),
+        "view_metadata": view_metadata,
     }
 
 
@@ -718,6 +1014,128 @@ def surface_statistics(merit: np.ndarray, center_index: int) -> dict:
         "maximum": float(finite_values.max()) if finite_values.size else None,
         "center": float(center) if np.isfinite(center) else None,
     }
+
+
+def plot_cached_landscapes(args: argparse.Namespace) -> None:
+    """Render existing raw surface files without loading model checkpoints."""
+    output_dir = Path(args.output_dir)
+    surfaces: Dict[Tuple[str, int], Dict[str, np.ndarray]] = {}
+    source_metadata = {}
+    reference_x = None
+    reference_y = None
+
+    for architecture in args.architectures:
+        for direction_seed in args.direction_seeds:
+            path = surface_path(
+                output_dir, architecture, direction_seed, args.surface_metric
+            )
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Missing raw surface: {path}. Select only architectures/seeds "
+                    "whose .npz files exist, or run 'visualize' after training."
+                )
+            with np.load(path, allow_pickle=False) as cached:
+                for required_key in ("X", "Y", "Z"):
+                    if required_key not in cached:
+                        raise ValueError(f"{path} is missing required array {required_key!r}")
+                x_grid = cached["X"].copy()
+                y_grid = cached["Y"].copy()
+                merit = cached["Z"].copy()
+                if x_grid.shape != y_grid.shape or x_grid.shape != merit.shape:
+                    raise ValueError(f"Inconsistent X/Y/Z shapes in {path}")
+                if reference_x is None:
+                    reference_x, reference_y = x_grid, y_grid
+                elif not (
+                    np.array_equal(x_grid, reference_x)
+                    and np.array_equal(y_grid, reference_y)
+                ):
+                    raise ValueError(
+                        f"{path} uses a different parameter grid; refusing a misleading comparison"
+                    )
+
+                scalar_metadata = {
+                    key: cached[key].item()
+                    for key in cached.files
+                    if cached[key].ndim == 0
+                }
+                stored_architecture = scalar_metadata.get("architecture")
+                stored_seed = scalar_metadata.get("direction_seed")
+                stored_metric = scalar_metadata.get("surface_metric", "merit")
+                if stored_metric != args.surface_metric:
+                    raise ValueError(
+                        f"{path} stores surface metric {stored_metric!r}, "
+                        f"not {args.surface_metric!r}"
+                    )
+                if stored_architecture is not None and stored_architecture != architecture:
+                    raise ValueError(
+                        f"{path} stores architecture {stored_architecture!r}, "
+                        f"not {architecture!r}"
+                    )
+                if stored_seed is not None and stored_seed != direction_seed:
+                    raise ValueError(
+                        f"{path} stores direction seed {stored_seed!r}, "
+                        f"not {direction_seed!r}"
+                    )
+                stored_penalty = scalar_metadata.get("penalty_weight")
+                if (
+                    args.surface_metric == "merit"
+                    and stored_penalty is not None
+                    and not np.isclose(stored_penalty, args.penalty_weight)
+                ):
+                    raise ValueError(
+                        f"{path} uses penalty weight {stored_penalty:g}; pass "
+                        f"--penalty-weight {stored_penalty:g} to plot it"
+                    )
+                stored_training_seed = scalar_metadata.get("training_seed")
+                if (
+                    stored_training_seed is not None
+                    and stored_training_seed != args.training_seed
+                ):
+                    raise ValueError(
+                        f"{path} uses training seed {stored_training_seed}; pass "
+                        f"--training-seed {stored_training_seed} to plot it"
+                    )
+
+            surfaces[(architecture, direction_seed)] = {
+                "X": x_grid,
+                "Y": y_grid,
+                "Z": merit,
+            }
+            source_metadata[f"{architecture}/direction_seed{direction_seed}"] = {
+                "path": str(path),
+                **scalar_metadata,
+            }
+
+    plot_metadata = plot_surfaces(surfaces, args, output_dir)
+    center_index = next(iter(surfaces.values()))["Z"].shape[0] // 2
+    manifest = {
+        "mode": "plot_existing_npz",
+        "surface_metric": args.surface_metric,
+        "architectures": list(args.architectures),
+        "training_seed": args.training_seed,
+        "direction_seeds": list(args.direction_seeds),
+        "merit_penalty_weight": (
+            args.penalty_weight if args.surface_metric == "merit" else None
+        ),
+        "loss_penalty_weight_override": args.loss_penalty_weight,
+        "plot_projection": "3d",
+        **plot_metadata,
+        "sources": source_metadata,
+        "surface_statistics": {
+            f"{architecture}/direction_seed{seed}": surface_statistics(
+                surface["Z"], center_index
+            )
+            for (architecture, seed), surface in surfaces.items()
+        },
+    }
+    manifest_path = output_dir / f"{plot_file_prefix(args)}_plot_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as file:
+        json.dump(manifest, file, indent=2, allow_nan=False)
+    print(
+        f"Rendered {len(surfaces)} cached 3D surfaces under {output_dir} "
+        f"without loading checkpoints.",
+        flush=True,
+    )
 
 
 def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None:
@@ -744,12 +1162,28 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
         pin_memory=torch.cuda.is_available(),
         num_workers=0,
     )
-    evaluate_merit = make_merit_evaluator(
-        problem,
-        evaluation_config,
-        equality_weight=args.penalty_weight,
-        inequality_weight=args.penalty_weight,
-    )
+    if args.surface_metric == "merit":
+        evaluate_surface = make_merit_evaluator(
+            problem,
+            evaluation_config,
+            equality_weight=args.penalty_weight,
+            inequality_weight=args.penalty_weight,
+        )
+        metric_metadata = {}
+    else:
+        evaluate_surface, metric_metadata = make_loss_evaluator(
+            problem,
+            evaluation_config,
+            loss_penalty_weight=args.loss_penalty_weight,
+        )
+        print(
+            "Loss surface weights: "
+            f"objective={metric_metadata['objective_weight']:g}, "
+            f"distance={metric_metadata['distance_weight']:g}, "
+            f"equality={metric_metadata['equality_penalty_weight']:g}, "
+            f"inequality={metric_metadata['inequality_penalty_weight']:g}",
+            flush=True,
+        )
     eval_signature = evaluation_signature(evaluation_config)
 
     surfaces: Dict[Tuple[str, int], Dict[str, np.ndarray]] = {}
@@ -760,7 +1194,9 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
         )
         checkpoint_digest = file_sha256(checkpoint_path(args, architecture))
         for direction_seed in args.direction_seeds:
-            path = surface_path(output_dir, architecture, direction_seed)
+            path = surface_path(
+                output_dir, architecture, direction_seed, args.surface_metric
+            )
             if path.exists() and not args.force_landscape:
                 with np.load(path, allow_pickle=False) as cached:
                     if cached_surface_matches(
@@ -770,6 +1206,7 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
                         direction_seed,
                         checkpoint_digest,
                         eval_signature,
+                        metric_metadata,
                     ):
                         print(f"Reusing landscape data: {path}", flush=True)
                         surfaces[(architecture, direction_seed)] = {
@@ -780,14 +1217,15 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
                         continue
 
             print(
-                f"\nComputing {architecture} landscape for direction seed {direction_seed} "
+                f"\nComputing {architecture} {args.surface_metric} landscape "
+                f"for direction seed {direction_seed} "
                 f"on {actual_test_size} examples",
                 flush=True,
             )
             x_grid, y_grid, merit = compute_merit_surface_2d(
                 model,
                 test_loader,
-                evaluate_merit,
+                evaluate_surface,
                 radius=args.radius,
                 grid_size=args.grid_size,
                 direction_seed=direction_seed,
@@ -804,6 +1242,7 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
                 direction_seed,
                 checkpoint_digest,
                 eval_signature,
+                metric_metadata,
             )
             surfaces[(architecture, direction_seed)] = {
                 "X": x_grid,
@@ -819,6 +1258,7 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
     plot_metadata = plot_surfaces(surfaces, args, output_dir)
     manifest = {
         "problem_type": args.prob_type,
+        "surface_metric": args.surface_metric,
         "problem_name": args.prob_name,
         "problem_size": list(args.prob_size),
         "architectures": list(args.architectures),
@@ -835,8 +1275,13 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
         "grid_size": args.grid_size,
         "landscape_test_size": actual_test_size,
         "landscape_batch_size": args.landscape_batch_size,
-        "equality_penalty_weight": args.penalty_weight,
-        "inequality_penalty_weight": args.penalty_weight,
+        "merit_equality_penalty_weight": (
+            args.penalty_weight if args.surface_metric == "merit" else None
+        ),
+        "merit_inequality_penalty_weight": (
+            args.penalty_weight if args.surface_metric == "merit" else None
+        ),
+        "loss_metadata": metric_metadata if args.surface_metric == "loss" else None,
         "device": str(DEVICE),
         "evaluation_signature": eval_signature,
         "landscape_format_version": LANDSCAPE_FORMAT_VERSION,
@@ -852,7 +1297,7 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
             for (architecture, seed), surface in surfaces.items()
         },
     }
-    manifest_path = output_dir / "merit_landscape_manifest.json"
+    manifest_path = output_dir / f"{plot_file_prefix(args)}_manifest.json"
     with manifest_path.open("w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2, allow_nan=False)
     print(f"\nSaved comparable plots and manifest under: {output_dir}", flush=True)
@@ -860,9 +1305,9 @@ def visualize_landscapes(base_config: Mapping, args: argparse.Namespace) -> None
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train and visualize matched FSNet architecture merit landscapes."
+        description="Train and visualize matched FSNet weight-direction surfaces."
     )
-    parser.add_argument("command", choices=("train", "visualize", "all"))
+    parser.add_argument("command", choices=("train", "visualize", "plot", "all"))
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument(
         "--architectures",
@@ -886,6 +1331,12 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=list(DEFAULT_DIRECTION_SEEDS),
     )
+    parser.add_argument(
+        "--surface-metric",
+        choices=SURFACE_METRICS,
+        default="merit",
+        help="Value evaluated along the weight directions (default: merit)",
+    )
 
     parser.add_argument("--num-epochs", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -898,7 +1349,20 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-progress-bar", action="store_true")
 
     parser.add_argument("--penalty-weight", type=float, default=1e4)
-    parser.add_argument("--radius", type=float, default=1.0)
+    parser.add_argument(
+        "--loss-penalty-weight",
+        type=float,
+        help=(
+            "Override both equality and inequality weights for loss surfaces; "
+            "by default the FSNet training configuration is used"
+        ),
+    )
+    parser.add_argument(
+        "--radius",
+        type=float,
+        default=1.0,
+        help="Weight-direction coordinate range is [-radius, radius] (default: 1)",
+    )
     parser.add_argument(
         "--grid-size",
         type=int,
@@ -915,6 +1379,25 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--elevation", type=float, default=30.0)
     parser.add_argument("--azimuth", type=float, default=-60.0)
+    parser.add_argument(
+        "--plot-scale",
+        choices=PLOT_SCALES,
+        default="global",
+        help=(
+            "Use one shared raw-value scale across all architectures, or one "
+            "raw-value scale per architecture across its direction seeds "
+            "(default: global)"
+        ),
+    )
+    parser.add_argument(
+        "--value-transform",
+        choices=VALUE_TRANSFORMS,
+        default="raw",
+        help=(
+            "Render raw values, unshifted base-10 log values, or both "
+            "(default: raw)"
+        ),
+    )
     parser.add_argument("--quiet-surface", action="store_true")
 
     parser.add_argument("--checkpoint-root", default="results/landscape_ablation")
@@ -933,6 +1416,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--radius must be positive")
     if args.penalty_weight < 0:
         parser.error("--penalty-weight must be nonnegative")
+    if args.loss_penalty_weight is not None and args.loss_penalty_weight < 0:
+        parser.error("--loss-penalty-weight must be nonnegative")
     if args.landscape_test_size == 0 or args.landscape_test_size < -1:
         parser.error("--landscape-test-size must be -1 (all) or a positive integer")
     if args.landscape_batch_size <= 0:
@@ -963,6 +1448,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 torch.cuda.empty_cache()
     if args.command in {"visualize", "all"}:
         visualize_landscapes(base_config, args)
+    elif args.command == "plot":
+        plot_cached_landscapes(args)
 
 
 if __name__ == "__main__":
