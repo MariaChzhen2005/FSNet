@@ -1,0 +1,241 @@
+{
+  "problem_type": "nonsmooth_nonconvex",
+  "surface_metric": "merit",
+  "problem_name": "socp",
+  "problem_size": [
+    100,
+    50,
+    50,
+    10000
+  ],
+  "architectures": [
+    "MLP",
+    "ICNN",
+    "ResMLP"
+  ],
+  "hidden_dim": 64,
+  "num_layers": 4,
+  "training_seed": 2025,
+  "direction_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "direction_seed_pairs": {
+    "0": [
+      0,
+      1000003
+    ],
+    "1": [
+      1,
+      1000004
+    ],
+    "2": [
+      2,
+      1000005
+    ],
+    "3": [
+      3,
+      1000006
+    ],
+    "4": [
+      4,
+      1000007
+    ]
+  },
+  "direction_norm": "filter",
+  "radius": 1.0,
+  "grid_size": 31,
+  "landscape_test_size": 128,
+  "landscape_batch_size": 128,
+  "merit_equality_penalty_weight": 10.0,
+  "merit_inequality_penalty_weight": 10.0,
+  "loss_metadata": null,
+  "device": "cuda:0",
+  "evaluation_signature": "2593a16724d331fd4ab2697c5f9697c2ad58bf444239e28774c3d069ae938a59",
+  "landscape_format_version": 1,
+  "network_implementation_versions": {
+    "MLP": 1,
+    "ICNN": 1,
+    "ResMLP": 2
+  },
+  "plot_scale": "local",
+  "value_transform": "raw",
+  "global_value_minimum": 7.599528883760351,
+  "global_value_maximum": 335.8916346630535,
+  "architecture_value_ranges": {
+    "MLP": {
+      "minimum": 7.599528883760351,
+      "maximum": 25.935997042194373,
+      "display_minimum": 7.599528883760351,
+      "display_maximum": 25.935997042194373
+    },
+    "ICNN": {
+      "minimum": 29.3100140085157,
+      "maximum": 335.8916346630535,
+      "display_minimum": 29.3100140085157,
+      "display_maximum": 335.8916346630535
+    },
+    "ResMLP": {
+      "minimum": 11.266061355867201,
+      "maximum": 52.76563080686344,
+      "display_minimum": 11.266061355867201,
+      "display_maximum": 52.76563080686344
+    }
+  },
+  "color_minimum": null,
+  "color_maximum": null,
+  "color_transform": "none (raw merit)",
+  "plot_projection": "3d",
+  "view_elevation": 30.0,
+  "view_azimuth": -60.0,
+  "value_transforms": [
+    "raw",
+    "log10"
+  ],
+  "view_metadata": {
+    "raw": {
+      "plot_scale": "local",
+      "value_transform": "raw",
+      "global_value_minimum": 7.599528883760351,
+      "global_value_maximum": 335.8916346630535,
+      "architecture_value_ranges": {
+        "MLP": {
+          "minimum": 7.599528883760351,
+          "maximum": 25.935997042194373,
+          "display_minimum": 7.599528883760351,
+          "display_maximum": 25.935997042194373
+        },
+        "ICNN": {
+          "minimum": 29.3100140085157,
+          "maximum": 335.8916346630535,
+          "display_minimum": 29.3100140085157,
+          "display_maximum": 335.8916346630535
+        },
+        "ResMLP": {
+          "minimum": 11.266061355867201,
+          "maximum": 52.76563080686344,
+          "display_minimum": 11.266061355867201,
+          "display_maximum": 52.76563080686344
+        }
+      },
+      "color_minimum": null,
+      "color_maximum": null,
+      "color_transform": "none (raw merit)",
+      "plot_projection": "3d",
+      "view_elevation": 30.0,
+      "view_azimuth": -60.0
+    },
+    "log10": {
+      "plot_scale": "local",
+      "value_transform": "log10",
+      "global_value_minimum": 0.880786669974864,
+      "global_value_maximum": 2.526199187929444,
+      "architecture_value_ranges": {
+        "MLP": {
+          "minimum": 0.880786669974864,
+          "maximum": 1.4139029479764194,
+          "display_minimum": 0.880786669974864,
+          "display_maximum": 1.4139029479764194
+        },
+        "ICNN": {
+          "minimum": 1.467016026006488,
+          "maximum": 2.526199187929444,
+          "display_minimum": 1.467016026006488,
+          "display_maximum": 2.526199187929444
+        },
+        "ResMLP": {
+          "minimum": 1.0517721121081016,
+          "maximum": 1.7223511344456823,
+          "display_minimum": 1.0517721121081016,
+          "display_maximum": 1.7223511344456823
+        }
+      },
+      "color_minimum": null,
+      "color_maximum": null,
+      "color_transform": "log10(raw merit), unshifted",
+      "plot_projection": "3d",
+      "view_elevation": 30.0,
+      "view_azimuth": -60.0
+    }
+  },
+  "surface_statistics": {
+    "MLP/direction_seed0": {
+      "minimum": 7.599528883760351,
+      "maximum": 24.553673515970132,
+      "center": 7.599528883760351
+    },
+    "MLP/direction_seed1": {
+      "minimum": 7.599528883760351,
+      "maximum": 24.135838708680062,
+      "center": 7.599528883760351
+    },
+    "MLP/direction_seed2": {
+      "minimum": 7.599528883760351,
+      "maximum": 25.935997042194373,
+      "center": 7.599528883760351
+    },
+    "MLP/direction_seed3": {
+      "minimum": 7.599528883760351,
+      "maximum": 23.557973172976524,
+      "center": 7.599528883760351
+    },
+    "MLP/direction_seed4": {
+      "minimum": 7.599528883760351,
+      "maximum": 25.300423441163826,
+      "center": 7.599528883760351
+    },
+    "ICNN/direction_seed0": {
+      "minimum": 29.52764853854886,
+      "maximum": 335.8916346630535,
+      "center": 30.256686579086892
+    },
+    "ICNN/direction_seed1": {
+      "minimum": 29.71979640587178,
+      "maximum": 262.22753996107843,
+      "center": 30.256686579086892
+    },
+    "ICNN/direction_seed2": {
+      "minimum": 29.408837072528367,
+      "maximum": 275.055022218497,
+      "center": 30.256686579086892
+    },
+    "ICNN/direction_seed3": {
+      "minimum": 29.539889159288663,
+      "maximum": 247.9200622253714,
+      "center": 30.256686579086892
+    },
+    "ICNN/direction_seed4": {
+      "minimum": 29.3100140085157,
+      "maximum": 284.09586104049913,
+      "center": 30.256686579086892
+    },
+    "ResMLP/direction_seed0": {
+      "minimum": 11.266061355867201,
+      "maximum": 38.79187936489484,
+      "center": 11.295907784453787
+    },
+    "ResMLP/direction_seed1": {
+      "minimum": 11.295907784453787,
+      "maximum": 47.27189409221567,
+      "center": 11.295907784453787
+    },
+    "ResMLP/direction_seed2": {
+      "minimum": 11.274914463603391,
+      "maximum": 52.76563080686344,
+      "center": 11.295907784453787
+    },
+    "ResMLP/direction_seed3": {
+      "minimum": 11.295907784453787,
+      "maximum": 41.91714320885728,
+      "center": 11.295907784453787
+    },
+    "ResMLP/direction_seed4": {
+      "minimum": 11.295907784453787,
+      "maximum": 41.08456453740702,
+      "center": 11.295907784453787
+    }
+  }
+}
