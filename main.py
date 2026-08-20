@@ -24,7 +24,8 @@ def create_parser():
     parser.add_argument('--prob_size', type=int, nargs='+', default=[100, 50, 50, 10000],
                         help='Problem size parameters [n, m, p, N] (default: [100, 50, 50, 10000])')
     parser.add_argument('--network', type=str, default='MLP',
-                        help='Type of neural network to use')
+                        choices=['MLP', 'ICNN', 'ResMLP'],
+                        help='Neural-network backbone')
     parser.add_argument('--seed', type=int, default=2025, help='Random seed for reproducibility')
     parser.add_argument('--ablation', type=bool, default=False)
 

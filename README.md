@@ -85,3 +85,56 @@ Each run writes metrics under its result directory in two portable formats:
 
 The existing `results_seed<seed>.pkl` also contains the complete metric history
 and detailed test predictions.
+
+### Architecture merit-landscape ablation
+
+Train and compare the four-layer, width-64 MLP, ICNN, and residual-MLP FSNet
+backbones on the nonsmooth nonconvex SOCP dataset with one command:
+
+```bash
+python compute_weight_to_merit_landscape_random.py all
+```
+
+The default landscape configuration uses training seed `2025`, matched random
+direction seeds `0 1 2 3 4`, a detailed `31 x 31` grid of actual merit
+evaluations per surface, 300-DPI rendering, filter-normalized directions over
+`[-1, 1]^2`, and the merit function
+
+```text
+objective + 1e4 * equality_L1_violation + 1e4 * inequality_L1_violation
+```
+
+Checkpoints are written below `results/landscape_ablation/`. Raw surfaces,
+individual 3D plots, matched-seed 3D comparison plots, an all-model 3D
+comparison, and a JSON manifest are written to `figures/`. Existing compatible
+checkpoints and surface data are reused automatically. The camera can be
+adjusted with `--elevation` and `--azimuth`. Every plot uses raw merit on the
+z-axis and one shared raw-merit color scale; no shifting or log transform is
+applied.
+
+The default full comparison computes 15 surfaces and 14,415 parameter points.
+That is intentionally detailed and can take substantial time because every
+point runs FSNet's feasibility refinement. Completed surfaces are cached. Use
+`--grid-size 41` for a very high-resolution run, or the smoke test below before
+committing to the full computation.
+
+The stages can also be run separately:
+
+```bash
+python compute_weight_to_merit_landscape_random.py train
+python compute_weight_to_merit_landscape_random.py visualize
+```
+
+For a quick pipeline smoke test before the full run:
+
+```bash
+python compute_weight_to_merit_landscape_random.py all \
+  --num-epochs 2 \
+  --grid-size 5 \
+  --landscape-test-size 16 \
+  --checkpoint-root results/landscape_ablation_smoke \
+  --output-dir figures/landscape_smoke
+```
+
+Use `--force-train` or `--force-landscape` to replace compatible cached output,
+and run the script with `--help` for grid, seed, checkpoint, and output options.

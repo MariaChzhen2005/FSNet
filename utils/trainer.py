@@ -15,7 +15,7 @@ import json
 
 from utils.optimization_utils import *
 from utils.lbfgs import nondiff_lbfgs_solve, hybrid_lbfgs_solve
-from models.neural_networks import MLP
+from models.neural_networks import build_network
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 torch.set_default_dtype(torch.float64)
@@ -143,14 +143,18 @@ def create_model(data, method, config):
     network = config['network']
     dropout = config["dropout"]
 
-    if network == 'MLP':
-        if method == "DC3":
-            out_dim = data.partial_vars.shape[0]
-            model = MLP(data.xdim, hidden_dim, out_dim, num_layers=num_layers, dropout=dropout)
-        else:
-            model = MLP(data.xdim, hidden_dim, data.ydim, num_layers=num_layers, dropout=dropout)
+    if method == "DC3":
+        out_dim = data.partial_vars.shape[0]
     else:
-        raise ValueError(f"Unknown model type: {model}")
+        out_dim = data.ydim
+    model = build_network(
+        network,
+        data.xdim,
+        hidden_dim,
+        out_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+    )
     return model.to(DEVICE)
 
 

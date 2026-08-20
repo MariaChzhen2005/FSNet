@@ -12,7 +12,7 @@ import ipdb
 
 from utils.optimization_utils import *
 from utils.lbfgs import nondiff_lbfgs_solve, hybrid_lbfgs_solve
-from models.neural_networks import MLP
+from models.neural_networks import build_network
 from utils.evaluator import Evaluator
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -120,14 +120,18 @@ def create_model(opt_problem, method, config):
     network = config['network']
     dropout = config["dropout"]
 
-    if network == 'MLP':
-        if method == "DC3" or method == "sup_partial":
-            out_dim = opt_problem.partial_vars.shape[0]
-            model = MLP(opt_problem.xdim, hidden_dim, out_dim, num_layers=num_layers, dropout=dropout)
-        else:
-            model = MLP(opt_problem.xdim, hidden_dim, opt_problem.ydim, num_layers=num_layers, dropout=dropout)
+    if method == "DC3" or method == "sup_partial":
+        out_dim = opt_problem.partial_vars.shape[0]
     else:
-        raise ValueError(f"Unknown model type: {model}")
+        out_dim = opt_problem.ydim
+    model = build_network(
+        network,
+        opt_problem.xdim,
+        hidden_dim,
+        out_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+    )
     return model.to(DEVICE)
 
 
